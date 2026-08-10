@@ -12,6 +12,14 @@ const users = new Map(); // ← FIX #2: Added missing Map
 
 const bot = new Telegraf(config.BOT_TOKEN);
 
+// 🧪 DEBUG: Log ALL incoming messages
+bot.use((ctx, next) => {
+    if (ctx.message?.text) {
+        console.log(`[DEBUG] Incoming text: "${ctx.message.text}" from user ${ctx.from.id}`);
+    }
+    return next();
+});
+
 // Add near the top
 const isAdmin = (telegramId) => config.ADMIN_TELEGRAM_IDS.includes(telegramId);
 
@@ -1658,6 +1666,9 @@ _Tap below to share your link._
     ]));
 });
 
+// ═══════════════════════════════════════════════════
+// 🎯 HELP BUTTON CALLBACK (from dashboard)
+// ═══════════════════════════════════════════════════
 bot.action('help', async (ctx) => {
     await ctx.answerCbQuery();
 
@@ -2425,7 +2436,9 @@ Select a topic below to learn more:
 // 🎯 /help COMMAND
 // ═══════════════════════════════════════════════════
 bot.command('help', async (ctx) => {
-    await ctx.replyWithMarkdown(`
+    try {
+        console.log(`[COMMAND] /help triggered by ${ctx.from.id}`);
+        await ctx.replyWithMarkdown(`
 ❓ *Help & Commands*
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -2447,19 +2460,21 @@ bot.command('help', async (ctx) => {
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ QUICK ACTIONS*
-Use /start to access the full dashboard with one-tap buttons for all features.
-
-━━━━━━━━━━━━━━━━━━━━━
-
 *▸ SUPPORT*
 [💬 Community](${config.CHANNEL_URL})
 [🌐 Website](${config.WEBSITE})
 `, Markup.inlineKeyboard([
-        [Markup.button.callback('📚 Documentation', 'docs_menu')],
-        [Markup.button.url('💬 Community', config.CHANNEL_URL)]
-    ]));
+            [Markup.button.callback('📚 Documentation', 'docs_menu')],
+            [Markup.button.url('💬 Community', config.CHANNEL_URL)]
+        ]));
+    } catch (err) {
+        console.error('❌ /help command error:', err);
+        await ctx.reply('❌ An error occurred. Please try again.');
+    }
 });
+
+
+
 // ═══════════════════════════════════════════════════
 // 🎯 /stop COMMAND (for users to disable random messages)
 // ═══════════════════════════════════════════════════
