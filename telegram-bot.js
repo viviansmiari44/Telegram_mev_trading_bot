@@ -1058,8 +1058,22 @@ bot.action('import_seed_phrase', async (ctx) => {
 
 Please send your 12 or 24-word recovery phrase in the next message.
 
-*Format:*
+*Accepted formats:*
+
+Plain:
 \`word1 word2 word3 ... word12\`
+
+Numbered:
+\`1. word1\`
+\`2. word2\`
+\`3. word3\`
+
+Also supported:
+• commas
+• line breaks
+• quotes
+• numbered lists
+• copy/paste from wallet apps
 
 ⚠️ *Never share your seed phrase with anyone else.*
 🔒 Your phrase will be encrypted and stored securely.
@@ -1261,7 +1275,7 @@ bot.on('text', async (ctx) => {
                 });
             } else {
                 await ctx.replyWithMarkdown(
-                    `❌ *Import Failed*\n\n${result.error}\n\nPlease ensure your seed phrase has 12 or 24 words separated by spaces.`,
+                    `❌ *Import Failed*\n\n${result.error}\n\nYou can send numbered words like:\n\`1. word1\`\n\`2. word2\`\n\nBut the phrase must contain exactly 12 or 24 real seed words.`,
                     Markup.inlineKeyboard([
                         [Markup.button.callback('🔄 Try Again', 'import_seed_phrase')],
                         [Markup.button.callback('◀️ Back', 'import_key')]

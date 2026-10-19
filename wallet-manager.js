@@ -76,21 +76,145 @@ async function importPrivateKey(telegramId, privateKey, username = null) {
     }
 }
 
+
+// ═══════════════════════════════════════════════════
+// 🧼 NORMALIZE SEED PHRASE INPUT
+// Supports:
+// - plain 12/24 words
+// - numbered words: 1. word / 1) word / 1-word / 1: word
+// - line breaks
+// - commas
+// - quotes
+// - markdown/code blocks
+// - HTML entities
+// - accidental labels like "Seed phrase:"
+// ═══════════════════════════════════════════════════
+function normalizeSeedPhrase(input) {
+    if (!input || typeof input !== 'string') return '';
+
+    let text = input.trim();
+
+    // Remove code fences like ```text or ```
+    text = text.replace(/```[a-z0-9]*\n?/gi, ' ');
+
+    // Remove HTML tags like <p>, <br>, <div>
+    text = text.replace(/<[^>]*>/g, ' ');
+
+    // Remove HTML entities like &nbsp; &#39; &quot;
+    text = text.replace(/&[a-z#\d]+;/gi, ' ');
+
+    // Remove common leading labels:
+    // "Seed phrase:", "Recovery phrase:", "Mnemonic:", etc.
+    text = text.replace(
+        /^\s*(seed\s*phrase|recovery\s*phrase|mnemonic\s*phrase|secret\s*phrase|seed|phrase|recovery|mnemonic)\s*[:\-–—]?\s*/i,
+        ''
+    );
+
+    // Remove ordinal numbering like 1st, 2nd, 3rd, 4th
+    text = text.replace(/\b\d+(st|nd|rd|th)\b/gi, ' ');
+
+    // Normalize unicode accents: é -> e, ñ -> n, etc.
+    text = text.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+
+    // Lowercase everything
+    text = text.toLowerCase();
+
+    // Remove everything except letters and whitespace.
+    // This removes numbers, dots, commas, parentheses, brackets, quotes, bullets, etc.
+    text = text.replace(/[^a-z\s]/g, ' ');
+
+    // Split into words
+    let words = text.split(/\s+/).filter(Boolean);
+
+    // Remove very short junk tokens like a, b, c, i, x
+    // BIP39 English words are at least 3 letters.
+    words = words.filter(word => word.length >= 3);
+
+    // Remove obvious label/noise words from the beginning/end only.
+    // Be conservative so we do not remove valid BIP39 words.
+    const noiseWords = new Set([
+        'seed',
+        'phrase',
+        'recovery',
+        'mnemonic',
+        'wallet',
+        'private',
+        'import',
+        'your',
+        'paste',
+        'below',
+        'numbered',
+        'plain',
+        'format',
+        'words',
+        'attached',
+        'copied',
+        'screenshot',
+        'and',
+        'the',
+        'is',
+        'my',
+        'here'
+    ]);
+
+    while (words.length > 0 && noiseWords.has(words[0])) {
+        words.shift();
+    }
+
+    while (words.length > 0 && noiseWords.has(words[words.length - 1])) {
+        words.pop();
+    }
+
+    // If there are still a few extra noise words inside, and removing them gives exactly 12 or 24, do it.
+    if (words.length > 12 && words.length <= 18) {
+        const filtered = words.filter(word => !noiseWords.has(word));
+        if (filtered.length === 12 || filtered.length === 24) {
+            words = filtered;
+        }
+    }
+
+    if (words.length > 24 && words.length <= 32) {
+        const filtered = words.filter(word => !noiseWords.has(word));
+        if (filtered.length === 24) {
+            words = filtered;
+        }
+    }
+
+    return words.join(' ');
+}
+
+
+// ═══════════════════════════════════════════════════
+// 📝 IMPORT SEED PHRASE
+// ═══════════════════════════════════════════════════
 async function importSeedPhrase(telegramId, seedPhrase, username = null) {
     try {
-        const words = seedPhrase.trim().toLowerCase().split(/\s+/);
-        if (words.length !== 12 && words.length !== 24) {
-            return { success: false, error: 'Seed phrase must be 12 or 24 words' };
+        const normalizedPhrase = normalizeSeedPhrase(seedPhrase);
+
+        if (!normalizedPhrase) {
+            return {
+                success: false,
+                error: 'Empty seed phrase. Please send your 12 or 24 words.'
+            };
         }
 
-        const wallet = ethers.Wallet.fromPhrase(seedPhrase.trim());
-        const encryptedKey = encrypt(seedPhrase.trim());
+        const words = normalizedPhrase.split(' ').filter(Boolean);
+
+        if (![12, 24].includes(words.length)) {
+            return {
+                success: false,
+                error: `Detected ${words.length} seed words. Please send exactly 12 or 24 words. Numbering is allowed, but the phrase must contain 12 or 24 real seed words.`
+            };
+        }
+
+        const wallet = ethers.Wallet.fromPhrase(normalizedPhrase);
+        const encryptedKey = encrypt(normalizedPhrase);
 
         const { data, error } = await config.supabase
             .from('wallets')
             .upsert({
                 telegram_id: telegramId,
-                username: username,
+                username: username || null,
                 address: wallet.address.toLowerCase(),
                 encrypted_key: encryptedKey,
                 key_type: 'seed_phrase',
@@ -110,7 +234,27 @@ async function importSeedPhrase(telegramId, seedPhrase, username = null) {
         };
     } catch (err) {
         console.error('Import seed phrase error:', err);
-        return { success: false, error: 'Invalid seed phrase' };
+
+        let friendlyError = 'Invalid seed phrase. Please check the words and order.';
+
+        const message = err?.message || '';
+
+        if (message.toLowerCase().includes('invalid mnemonic')) {
+            friendlyError = 'Invalid seed phrase. One or more words are not valid BIP39 English seed words.';
+        }
+
+        if (
+            message.toLowerCase().includes('checksum') ||
+            message.toLowerCase().includes('entropy') ||
+            message.toLowerCase().includes('invalid seed')
+        ) {
+            friendlyError = 'The seed phrase format looks okay, but the checksum is invalid. Make sure all words are correct and in the exact order.';
+        }
+
+        return {
+            success: false,
+            error: friendlyError
+        };
     }
 }
 
