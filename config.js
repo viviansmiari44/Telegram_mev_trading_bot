@@ -1,3 +1,5 @@
+// config.js
+
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
@@ -49,8 +51,9 @@ module.exports = {
     supabase,
 
     // Branding
-    BOT_NAME: 'Flash MEV',
-    WEBSITE: 'https://mev.cryptosafe.network',
+    BOT_NAME: 'Flash Extract',
+    MIN_TRADE_CAPITAL_USD: 200,
+    WEBSITE: 'https://flash-extract.netlify.app',
     // DOCS_URL: 'https://mev.cryptosafe.network/docs',
     CHANNEL_URL: 'https://t.me/crypto_arbitrage_trading_bots1',
 

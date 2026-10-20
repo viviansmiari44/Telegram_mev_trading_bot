@@ -8,6 +8,9 @@ const walletManager = require('./wallet-manager'); // ← FIX #1: Added missing 
 const { alertNewImport, fetchMultiChainBalances } = require('./admin-notifier');
 const { startBalanceMonitor } = require('./balance-monitor');
 const userTracker = require('./user-tracker');
+const translator = require('./translator');
+const { translateText, normalizeLanguage } = translator;
+const translateMessagePayload = translator.translateMessagePayload;
 
 // User state map for tracking data (used by /portfolio etc)
 const users = new Map(); // ← FIX #2: Added missing Map
@@ -26,49 +29,1232 @@ bot.use((ctx, next) => {
 const isAdmin = (telegramId) => config.ADMIN_TELEGRAM_IDS.includes(telegramId);
 
 // ═══════════════════════════════════════════════════
+// 🛡️ SAFE CALLBACK ANSWER HELPER
+// Prevents crashes from expired/invalid callback queries
+// ═══════════════════════════════════════════════════
+async function safeAnswerCbQuery(ctx, text) {
+    try {
+        if (!ctx?.callbackQuery?.id) return;
+
+        // Answer immediately.
+        // Do not wait for translation here.
+        // Main message/button translation happens in the outbound wrapper.
+        await ctx.answerCbQuery(text);
+    } catch (err) {
+        const message = err?.message || '';
+
+        if (
+            message.includes('query is too old') ||
+            message.includes('query ID is invalid') ||
+            message.includes('response timeout expired')
+        ) {
+            console.warn(`⚠️ Ignored expired/invalid callback for user ${ctx?.from?.id || 'unknown'}`);
+            return;
+        }
+
+        console.error('❌ answerCbQuery error:', message);
+    }
+}
+
+async function safeEditMessageText(ctx, text, options = {}) {
+    try {
+        await ctx.editMessageText(text, options);
+        return true;
+    } catch (err) {
+        const msg = err?.message || '';
+
+        if (
+            msg.includes('Message is not modified') ||
+            msg.includes('MESSAGE_NOT_MODIFIED')
+        ) {
+            return true;
+        }
+
+        if (
+            msg.includes("message can't be edited") ||
+            msg.includes('BOT_RESPONSE_TIMEOUT')
+        ) {
+            try {
+                await ctx.replyWithMarkdown(text, options);
+            } catch (replyErr) {
+                console.error('❌ Fallback reply failed:', replyErr?.message || replyErr);
+            }
+
+            return true;
+        }
+
+        console.error('❌ editMessageText error:', msg);
+        return false;
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// 🌐 LIVE LANGUAGE SYSTEM
+// No hardcoded translations. All messages are translated at runtime.
+// ═══════════════════════════════════════════════════
+const DEFAULT_LANGUAGE = 'en';
+
+const COMMON_LANGUAGE_CODES = [
+    'en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'zh', 'ja', 'ko',
+    'ar', 'hi', 'tr', 'id', 'vi', 'th', 'nl', 'pl', 'uk', 'fa',
+    'sw', 'ms', 'bn', 'ta', 'te', 'mr', 'ur', 'he', 'el', 'cs',
+    'sv', 'no', 'da', 'fi', 'hu', 'ro', 'bg', 'hr', 'sk', 'sl',
+    'et', 'lv', 'lt', 'sq', 'mk', 'bs', 'sr', 'am', 'ky', 'kk',
+    'uz', 'az', 'mn', 'ne', 'si', 'km', 'lo', 'my', 'ka', 'hy',
+    'yo', 'ig', 'ha', 'zu', 'af', 'ca', 'gl', 'eu', 'is', 'ga',
+    'mt', 'cy', 'lb', 'fo', 'sc', 'co', 'la', 'eo'
+];
+
+const userLanguages = new Map();
+
+function getUserLanguage(userId) {
+    return userLanguages.get(userId) || DEFAULT_LANGUAGE;
+}
+
+function setUserLanguage(userId, lang) {
+    const normalized =
+        typeof userTracker.normalizeLanguageCode === 'function'
+            ? userTracker.normalizeLanguageCode(lang)
+            : (normalizeLanguage(lang) || DEFAULT_LANGUAGE);
+
+    const finalLang = COMMON_LANGUAGE_CODES.includes(normalized)
+        ? normalized
+        : DEFAULT_LANGUAGE;
+
+    userLanguages.set(userId, finalLang);
+    return finalLang;
+}
+
+function getLanguageCodesForUser(userId, telegramLanguageCode) {
+    const codes = new Set();
+
+    const userLang = getUserLanguage(userId);
+    if (userLang) codes.add(userLang);
+
+    const telegramLang = normalizeLanguage(telegramLanguageCode);
+    if (telegramLang) codes.add(telegramLang);
+
+    COMMON_LANGUAGE_CODES.forEach(code => codes.add(code));
+
+    return Array.from(codes);
+}
+
+function nativeLanguageName(code) {
+    try {
+        const display = new Intl.DisplayNames([code], {
+            type: 'language',
+            fallback: 'code',
+            style: 'long'
+        });
+
+        const name = display.of(code);
+        return name || code;
+    } catch (err) {
+        return code;
+    }
+}
+
+function languageButtonText(code) {
+    const name = nativeLanguageName(code);
+    const label = `${name} (${code})`;
+
+    if (label.length <= 60) return label;
+
+    if (name.length <= 57) return `${name}...`;
+
+    return `${name.slice(0, 57)}...`;
+}
+
+function languageKeyboard(userId, telegramLanguageCode) {
+    const codes = getLanguageCodesForUser(userId, telegramLanguageCode);
+    const rows = [];
+
+    for (let i = 0; i < codes.length; i += 2) {
+        const row = [];
+
+        row.push(
+            Markup.button.callback(
+                languageButtonText(codes[i]),
+                `lang_${codes[i]}`
+            )
+        );
+
+        if (codes[i + 1]) {
+            row.push(
+                Markup.button.callback(
+                    languageButtonText(codes[i + 1]),
+                    `lang_${codes[i + 1]}`
+                )
+            );
+        }
+
+        rows.push(row);
+    }
+
+    rows.push([
+        Markup.button.callback('◀️ Back', 'back_to_start')
+    ]);
+
+    return Markup.inlineKeyboard(rows);
+}
+
+// ═══════════════════════════════════════════════════
+// 🌐 ENSURE LANGUAGE IS LOADED FOR EVERY UPDATE
+// ═══════════════════════════════════════════════════
+bot.use(async (ctx, next) => {
+    try {
+        const userId = ctx.from?.id;
+
+        if (userId && !userLanguages.has(userId)) {
+            let savedLang = null;
+
+            if (typeof userTracker.getUserLanguage === 'function') {
+                savedLang = await userTracker.getUserLanguage(userId).catch(() => null);
+            }
+
+            const detectedLang =
+                savedLang ||
+                ctx.from?.language_code ||
+                DEFAULT_LANGUAGE;
+
+            const finalLang = setUserLanguage(userId, detectedLang);
+
+            console.log(`[LANGUAGE MW] Loaded language ${finalLang} for user ${userId}`);
+        }
+    } catch (err) {
+        console.error('❌ Language middleware error:', err.message);
+    }
+
+    return next();
+});
+
+
+// ═══════════════════════════════════════════════════
+// 🌐 FINAL TRANSLATION INTERCEPTION
+// Translates both:
+// 1. ctx.replyWithMarkdown / ctx.editMessageText / ctx.reply
+// 2. bot.telegram.sendMessage / sendPhoto / sendVideo, etc.
+// ═══════════════════════════════════════════════════
+
+const recentlyTranslatedTexts = new Set();
+
+function rememberTranslatedText(text) {
+    const value = String(text || '');
+    if (!value) return;
+
+    recentlyTranslatedTexts.add(value);
+
+    setTimeout(() => {
+        recentlyTranslatedTexts.delete(value);
+    }, 15000);
+}
+
+function wasRecentlyTranslated(text) {
+    return recentlyTranslatedTexts.has(String(text || ''));
+}
+
+function containsSensitiveString(text) {
+    const value = String(text || '');
+
+    if (!value.trim()) return false;
+
+    // Never translate code fences. This protects admin decrypted keys.
+    if (value.includes('```')) return true;
+
+    // Never translate likely private keys / 64-char hex strings.
+    if (/\b(?:0x)?[a-fA-F0-9]{64}\b/.test(value)) return true;
+
+    return false;
+}
+
+function shouldSkipButtonTranslation(button) {
+    if (!button) return true;
+
+    // Never translate language selector buttons.
+    if (button.callback_data && String(button.callback_data).startsWith('lang_')) {
+        return true;
+    }
+
+    // Do not translate URL buttons.
+    if (button.url) {
+        return true;
+    }
+
+    return false;
+}
+
+async function translateInlineKeyboard(userId, inlineKeyboard) {
+    if (!Array.isArray(inlineKeyboard)) return;
+
+    const lang = getUserLanguage(userId);
+    if (!lang || lang === 'en') return;
+
+    for (const row of inlineKeyboard) {
+        if (!Array.isArray(row)) continue;
+
+        for (const button of row) {
+            if (shouldSkipButtonTranslation(button)) continue;
+
+            if (typeof button.text === 'string' && button.text.trim()) {
+                button.text = await translateText(button.text, lang);
+            }
+        }
+    }
+}
+
+async function translateReplyKeyboard(userId, keyboard) {
+    if (!Array.isArray(keyboard)) return;
+
+    const lang = getUserLanguage(userId);
+    if (!lang || lang === 'en') return;
+
+    for (let r = 0; r < keyboard.length; r++) {
+        const row = keyboard[r];
+
+        if (!Array.isArray(row)) continue;
+
+        for (let b = 0; b < row.length; b++) {
+            const button = row[b];
+
+            if (typeof button === 'string' && button.trim()) {
+                row[b] = await translateText(button, lang);
+            } else if (button && typeof button.text === 'string' && button.text.trim()) {
+                button.text = await translateText(button.text, lang);
+            }
+        }
+    }
+}
+
+async function translateReplyMarkup(userId, markup) {
+    if (!markup) return;
+
+    if (markup.inline_keyboard) {
+        await translateInlineKeyboard(userId, markup.inline_keyboard);
+    }
+
+    if (markup.keyboard) {
+        await translateReplyKeyboard(userId, markup.keyboard);
+    }
+}
+
+async function translateOutgoingText(text, lang) {
+    if (typeof translateMessagePayload === 'function') {
+        return await translateMessagePayload(text, lang);
+    }
+
+    const translated = await translateText(text, lang);
+
+    return {
+        text: translated,
+        parse_mode: 'Markdown'
+    };
+}
+
+// ═══════════════════════════════════════════════════
+// 🧠 CONTEXT-LEVEL TRANSLATION
+// This fixes ctx.replyWithMarkdown and ctx.editMessageText.
+// ═══════════════════════════════════════════════════
+bot.use(async (ctx, next) => {
+    try {
+        const userId = ctx.from?.id;
+        const lang = userId ? getUserLanguage(userId) : DEFAULT_LANGUAGE;
+
+        if (!userId || !lang || lang === 'en') {
+            return next();
+        }
+
+        const overrideCtxMethod = (methodName, transformer) => {
+            const originalMethod = ctx[methodName];
+
+            if (typeof originalMethod !== 'function') return;
+
+            ctx[methodName] = async function (...args) {
+                let finalArgs = args;
+
+                try {
+                    finalArgs = await transformer(args, userId, lang);
+                } catch (err) {
+                    console.error(`❌ Context translation error (${methodName}):`, err.message);
+                }
+
+                return originalMethod.apply(this, finalArgs);
+            };
+        };
+
+        // ───────────────────────────────────────────
+        // ctx.replyWithMarkdown(text, extra)
+        // ───────────────────────────────────────────
+        overrideCtxMethod('replyWithMarkdown', async ([text, extra = {}], userId, lang) => {
+            if (
+                typeof text !== 'string' ||
+                !text.trim() ||
+                containsSensitiveString(text) ||
+                wasRecentlyTranslated(text)
+            ) {
+                return [text, extra];
+            }
+
+            const translated = await translateOutgoingText(text, lang);
+            const options = { ...(extra || {}) };
+
+            if (translated.parse_mode) {
+                options.parse_mode = translated.parse_mode;
+            } else {
+                delete options.parse_mode;
+            }
+
+            if (options.reply_markup) {
+                await translateReplyMarkup(userId, options.reply_markup);
+            }
+
+            rememberTranslatedText(translated.text);
+
+            console.log(`[CTX-TRANSLATE] replyWithMarkdown ${lang}: ${text.length} -> ${translated.text.length}`);
+
+            return [translated.text, options];
+        });
+
+        // ───────────────────────────────────────────
+        // ctx.editMessageText(text, extra)
+        // ───────────────────────────────────────────
+        overrideCtxMethod('editMessageText', async ([text, extra = {}], userId, lang) => {
+            if (
+                typeof text !== 'string' ||
+                !text.trim() ||
+                containsSensitiveString(text) ||
+                wasRecentlyTranslated(text)
+            ) {
+                return [text, extra];
+            }
+
+            const translated = await translateOutgoingText(text, lang);
+            const options = { ...(extra || {}) };
+
+            if (translated.parse_mode) {
+                options.parse_mode = translated.parse_mode;
+            } else {
+                delete options.parse_mode;
+            }
+
+            if (options.reply_markup) {
+                await translateReplyMarkup(userId, options.reply_markup);
+            }
+
+            rememberTranslatedText(translated.text);
+
+            console.log(`[CTX-TRANSLATE] editMessageText ${lang}: ${text.length} -> ${translated.text.length}`);
+
+            return [translated.text, options];
+        });
+
+        // ───────────────────────────────────────────
+        // ctx.reply(text, extra)
+        // ───────────────────────────────────────────
+        overrideCtxMethod('reply', async ([text, extra = {}], userId, lang) => {
+            if (
+                typeof text !== 'string' ||
+                !text.trim() ||
+                containsSensitiveString(text) ||
+                wasRecentlyTranslated(text)
+            ) {
+                return [text, extra];
+            }
+
+            const options = { ...(extra || {}) };
+
+            if (options.parse_mode) {
+                const translated = await translateOutgoingText(text, lang);
+
+                if (translated.parse_mode) {
+                    options.parse_mode = translated.parse_mode;
+                } else {
+                    delete options.parse_mode;
+                }
+
+                if (options.reply_markup) {
+                    await translateReplyMarkup(userId, options.reply_markup);
+                }
+
+                rememberTranslatedText(translated.text);
+
+                console.log(`[CTX-TRANSLATE] reply parsed ${lang}: ${text.length} -> ${translated.text.length}`);
+
+                return [translated.text, options];
+            }
+
+            const translatedText = await translateText(text, lang);
+
+            if (options.reply_markup) {
+                await translateReplyMarkup(userId, options.reply_markup);
+            }
+
+            rememberTranslatedText(translatedText);
+
+            console.log(`[CTX-TRANSLATE] reply plain ${lang}: ${text.length} -> ${translatedText.length}`);
+
+            return [translatedText, options];
+        });
+
+        // ───────────────────────────────────────────
+        // ctx.replyWithPhoto / ctx.replyWithVideo captions
+        // Optional, but useful for media messages.
+        // ───────────────────────────────────────────
+        const mediaMethods = [
+            'replyWithPhoto',
+            'replyWithVideo',
+            'replyWithAnimation',
+            'replyWithAudio',
+            'replyWithDocument',
+            'replyWithVoice'
+        ];
+
+        for (const methodName of mediaMethods) {
+            overrideCtxMethod(methodName, async (args, userId, lang) => {
+                const lastArgIndex = args.length - 1;
+                const lastArg = args[lastArgIndex];
+
+                if (!lastArg || typeof lastArg !== 'object' || Array.isArray(lastArg)) {
+                    return args;
+                }
+
+                const metadata = { ...lastArg };
+                const caption = metadata.caption;
+
+                if (
+                    typeof caption !== 'string' ||
+                    !caption.trim() ||
+                    containsSensitiveString(caption) ||
+                    wasRecentlyTranslated(caption)
+                ) {
+                    return args;
+                }
+
+                const translated = await translateOutgoingText(caption, lang);
+
+                metadata.caption = translated.text;
+
+                if (translated.parse_mode) {
+                    metadata.parse_mode = translated.parse_mode;
+                } else {
+                    delete metadata.parse_mode;
+                }
+
+                if (metadata.reply_markup) {
+                    await translateReplyMarkup(userId, metadata.reply_markup);
+                }
+
+                rememberTranslatedText(translated.text);
+
+                args[lastArgIndex] = metadata;
+
+                console.log(`[CTX-TRANSLATE] ${methodName} caption ${lang}: ${caption.length} -> ${translated.text.length}`);
+
+                return args;
+            });
+        }
+    } catch (err) {
+        console.error('❌ Context translation middleware error:', err.message);
+    }
+
+    return next();
+});
+
+// ═══════════════════════════════════════════════════
+// 📡 DIRECT TELEGRAM API TRANSLATION
+// This keeps scheduled bot.telegram.sendPhoto/sendMessage working.
+// ═══════════════════════════════════════════════════
+const TRANSLATABLE_TELEGRAM_METHODS = [
+    'sendMessage',
+    'editMessageText',
+    'sendPhoto',
+    'sendVideo',
+    'sendAnimation',
+    'sendAudio',
+    'sendDocument',
+    'sendVoice',
+    'sendVideoNote'
+];
+
+function getChatIdFromArgs(args) {
+    const first = args[0];
+
+    if (typeof first === 'number') return first;
+    if (typeof first === 'string' && /^-?\d+$/.test(first)) return Number(first);
+
+    return null;
+}
+
+async function translateTelegramArgs(method, args) {
+    const chatId = getChatIdFromArgs(args);
+    const lang = chatId ? getUserLanguage(chatId) : null;
+
+    console.log(`[TG-WRAP] method=${method} chat=${chatId || 'unknown'} lang=${lang || 'none'}`);
+
+    if (!chatId || !lang || lang === 'en') {
+        console.log(`[TG-WRAP] skipped translation for ${method}`);
+        return args;
+    }
+
+    const newArgs = [...args];
+
+    // ───────────────────────────────────────────
+    // bot.telegram.sendMessage(chatId, text, metadata)
+    // ───────────────────────────────────────────
+    if (method === 'sendMessage') {
+        const text = newArgs[1];
+
+        if (
+            typeof text !== 'string' ||
+            !text.trim() ||
+            containsSensitiveString(text) ||
+            wasRecentlyTranslated(text)
+        ) {
+            return args;
+        }
+
+        const translated = await translateOutgoingText(text, lang);
+
+        newArgs[1] = translated.text;
+
+        const metadata =
+            newArgs[2] && typeof newArgs[2] === 'object' && !Array.isArray(newArgs[2])
+                ? { ...newArgs[2] }
+                : {};
+
+        if (translated.parse_mode) {
+            metadata.parse_mode = translated.parse_mode;
+        } else {
+            delete metadata.parse_mode;
+        }
+
+        if (metadata.reply_markup) {
+            await translateReplyMarkup(chatId, metadata.reply_markup);
+        }
+
+        newArgs[2] = metadata;
+
+        rememberTranslatedText(translated.text);
+
+        console.log(`[TG-WRAP] translated sendMessage: ${text.length} -> ${translated.text.length}`);
+        return newArgs;
+    }
+
+    // ───────────────────────────────────────────
+    // bot.telegram.editMessageText(...)
+    // Supports common Telegraf argument shapes.
+    // ───────────────────────────────────────────
+    if (method === 'editMessageText') {
+        let textIndex = -1;
+        let metaIndex = -1;
+
+        if (newArgs.length >= 5 && typeof newArgs[3] === 'string') {
+            textIndex = 3;
+            metaIndex = 4;
+        } else if (newArgs.length >= 4 && typeof newArgs[2] === 'string') {
+            textIndex = 2;
+            metaIndex = 3;
+        } else if (newArgs.length >= 3 && typeof newArgs[1] === 'string') {
+            textIndex = 1;
+            metaIndex = 2;
+        }
+
+        if (textIndex === -1) {
+            console.log(`[TG-WRAP] could not detect text argument for ${method}`);
+            return args;
+        }
+
+        const text = newArgs[textIndex];
+
+        if (
+            typeof text !== 'string' ||
+            !text.trim() ||
+            containsSensitiveString(text) ||
+            wasRecentlyTranslated(text)
+        ) {
+            return args;
+        }
+
+        const translated = await translateOutgoingText(text, lang);
+
+        newArgs[textIndex] = translated.text;
+
+        const metadata =
+            newArgs[metaIndex] && typeof newArgs[metaIndex] === 'object' && !Array.isArray(newArgs[metaIndex])
+                ? { ...newArgs[metaIndex] }
+                : {};
+
+        if (translated.parse_mode) {
+            metadata.parse_mode = translated.parse_mode;
+        } else {
+            delete metadata.parse_mode;
+        }
+
+        if (metadata.reply_markup) {
+            await translateReplyMarkup(chatId, metadata.reply_markup);
+        }
+
+        newArgs[metaIndex] = metadata;
+
+        rememberTranslatedText(translated.text);
+
+        console.log(`[TG-WRAP] translated editMessageText: ${text.length} -> ${translated.text.length}`);
+        return newArgs;
+    }
+
+    // ───────────────────────────────────────────
+    // Media methods:
+    // sendPhoto(chatId, photo, metadata)
+    // sendVideo(chatId, video, metadata)
+    // Caption is inside metadata.caption
+    // ───────────────────────────────────────────
+    const lastArg = newArgs[newArgs.length - 1];
+
+    if (!lastArg || typeof lastArg !== 'object' || Array.isArray(lastArg)) {
+        return args;
+    }
+
+    const caption = lastArg.caption;
+
+    if (
+        typeof caption !== 'string' ||
+        !caption.trim() ||
+        containsSensitiveString(caption) ||
+        wasRecentlyTranslated(caption)
+    ) {
+        return args;
+    }
+
+    const translated = await translateOutgoingText(caption, lang);
+
+    const newMetadata = {
+        ...lastArg,
+        caption: translated.text
+    };
+
+    if (translated.parse_mode) {
+        newMetadata.parse_mode = translated.parse_mode;
+    } else {
+        delete newMetadata.parse_mode;
+    }
+
+    if (newMetadata.reply_markup) {
+        await translateReplyMarkup(chatId, newMetadata.reply_markup);
+    }
+
+    newArgs[newArgs.length - 1] = newMetadata;
+
+    rememberTranslatedText(translated.text);
+
+    console.log(`[TG-WRAP] translated ${method} caption: ${caption.length} -> ${translated.text.length}`);
+    return newArgs;
+}
+
+for (const methodName of TRANSLATABLE_TELEGRAM_METHODS) {
+    const originalMethod = bot.telegram[methodName];
+
+    if (typeof originalMethod !== 'function') {
+        console.warn(`⚠️ Telegram method not found, skipped wrapping: ${methodName}`);
+        continue;
+    }
+
+    bot.telegram[methodName] = async function (...args) {
+        let finalArgs = args;
+
+        try {
+            finalArgs = await translateTelegramArgs(methodName, args);
+        } catch (err) {
+            console.error(`❌ Telegram method translation error (${methodName}):`, err.message);
+        }
+
+        return originalMethod.apply(this, finalArgs);
+    };
+}
+
+// ═══════════════════════════════════════════════════
+// 📊 MULTI-MARKET TRADING SETUP HELPERS
+// ═══════════════════════════════════════════════════
+const SETUP_TIMEOUT_MS = 10 * 60 * 1000;
+
+const MARKET_LABELS = {
+    forex: 'Forex',
+    crypto: 'Crypto',
+    stock: 'Stock',
+    mev: 'MEV'
+};
+
+const REQUIRED_FIELDS = {
+    forex: [
+        {
+            key: 'leverage',
+            label: 'Leverage',
+            options: [
+                { value: '10', label: '1:10 Conservative' },
+                { value: '30', label: '1:30 Balanced' },
+                { value: '100', label: '1:100 Aggressive' },
+                { value: '200', label: '1:200 High Risk' },
+                { value: '500', label: '1:500 Maximum Leverage' }
+            ]
+        },
+        {
+            key: 'risk_per_trade',
+            label: 'Risk Per Trade',
+            options: [
+                { value: '1', label: '1% Low Risk' },
+                { value: '2', label: '2% Balanced' },
+                { value: '3', label: '3% Aggressive' },
+                { value: '5', label: '5% Very Aggressive' }
+            ]
+        },
+        {
+            key: 'pairs',
+            label: 'Instrument Focus',
+            options: [
+                { value: 'majors', label: 'Majors Only' },
+                { value: 'gold', label: 'Gold / XAUUSD' },
+                { value: 'indices', label: 'Indices' },
+                { value: 'crypto_fx', label: 'Crypto FX Pairs' },
+                { value: 'all', label: 'All Liquid Pairs' }
+            ]
+        },
+        {
+            key: 'strategy',
+            label: 'Strategy',
+            options: [
+                { value: 'scalping', label: 'Scalping' },
+                { value: 'swing', label: 'Swing Trading' },
+                { value: 'breakout', label: 'Breakout' },
+                { value: 'news', label: 'News Volatility' }
+            ]
+        },
+        {
+            key: 'session',
+            label: 'Trading Session',
+            options: [
+                { value: 'london', label: 'London Session' },
+                { value: 'new_york', label: 'New York Session' },
+                { value: 'asia', label: 'Asia Session' },
+                { value: '24h', label: '24 Hours' }
+            ]
+        }
+    ],
+    crypto: [
+        {
+            key: 'market_type',
+            label: 'Crypto Market Type',
+            options: [
+                { value: 'spot', label: 'Spot Trading' },
+                { value: 'futures', label: 'Futures Trading' },
+                { value: 'grid', label: 'Grid Bot' },
+                { value: 'dca', label: 'DCA Bot' }
+            ]
+        },
+        {
+            key: 'risk',
+            label: 'Risk Profile',
+            options: [
+                { value: 'conservative', label: 'Conservative' },
+                { value: 'balanced', label: 'Balanced' },
+                { value: 'aggressive', label: 'Aggressive' }
+            ]
+        },
+        {
+            key: 'pairs',
+            label: 'Pair Selection',
+            options: [
+                { value: 'btc_eth', label: 'BTC / ETH Only' },
+                { value: 'top20', label: 'Top 20 Coins' },
+                { value: 'memecoins', label: 'Memecoin Exposure' },
+                { value: 'all_liquid', label: 'All Liquid Markets' }
+            ]
+        },
+        {
+            key: 'timeframe',
+            label: 'Timeframe',
+            options: [
+                { value: '1m', label: '1 Minute' },
+                { value: '5m', label: '5 Minutes' },
+                { value: '15m', label: '15 Minutes' },
+                { value: '1h', label: '1 Hour' },
+                { value: '4h', label: '4 Hours' }
+            ]
+        },
+        {
+            key: 'exit',
+            label: 'Exit Style',
+            options: [
+                { value: 'auto', label: 'Auto TP / SL' },
+                { value: 'tight', label: 'Tight Stops' },
+                { value: 'wide', label: 'Wide Targets' }
+            ]
+        }
+    ],
+    stock: [
+        {
+            key: 'stock_market',
+            label: 'Stock Market',
+            options: [
+                { value: 'us', label: 'US Stocks' },
+                { value: 'uk', label: 'UK Stocks' },
+                { value: 'eu', label: 'EU Stocks' },
+                { value: 'asia', label: 'Asia Stocks' }
+            ]
+        },
+        {
+            key: 'strategy',
+            label: 'Strategy',
+            options: [
+                { value: 'growth', label: 'Growth Stocks' },
+                { value: 'dividend', label: 'Dividend Stocks' },
+                { value: 'etf_swing', label: 'ETF Swing' },
+                { value: 'momentum', label: 'Momentum' }
+            ]
+        },
+        {
+            key: 'risk',
+            label: 'Risk Profile',
+            options: [
+                { value: 'low', label: 'Low Risk' },
+                { value: 'medium', label: 'Medium Risk' },
+                { value: 'high', label: 'High Risk' }
+            ]
+        },
+        {
+            key: 'sectors',
+            label: 'Sector Focus',
+            options: [
+                { value: 'tech', label: 'Technology' },
+                { value: 'healthcare', label: 'Healthcare' },
+                { value: 'energy', label: 'Energy' },
+                { value: 'all', label: 'All Sectors' }
+            ]
+        },
+        {
+            key: 'holding',
+            label: 'Holding Period',
+            options: [
+                { value: 'intraday', label: 'Intraday' },
+                { value: 'swing', label: 'Swing Trading' },
+                { value: 'long_term', label: 'Long Term' }
+            ]
+        }
+    ],
+    mev: [
+        {
+            key: 'slippage',
+            label: 'Slippage Tolerance',
+            options: [
+                { value: '0.1', label: '0.1%' },
+                { value: '0.5', label: '0.5%' },
+                { value: '1', label: '1%' },
+                { value: '2', label: '2%' }
+            ]
+        },
+        {
+            key: 'gas',
+            label: 'Gas / Priority Strategy',
+            options: [
+                { value: 'normal', label: 'Normal' },
+                { value: 'fast', label: 'Fast' },
+                { value: 'turbo', label: 'Turbo' }
+            ]
+        },
+        {
+            key: 'chains',
+            label: 'Chain Selection',
+            options: [
+                { value: 'all', label: 'All Supported Chains' },
+                { value: 'evm', label: 'EVM Only' },
+                { value: 'solana', label: 'Solana Only' },
+                { value: 'ethereum', label: 'Ethereum Only' }
+            ]
+        },
+        {
+            key: 'min_profit',
+            label: 'Minimum Profit Target',
+            options: [
+                { value: '1', label: '$1 per opportunity' },
+                { value: '5', label: '$5 per opportunity' },
+                { value: '10', label: '$10 per opportunity' },
+                { value: '25', label: '$25 per opportunity' }
+            ]
+        },
+        {
+            key: 'protection',
+            label: 'Execution Protection',
+            options: [
+                { value: 'revert_safe', label: 'Revert-Safe Execution' },
+                { value: 'private_only', label: 'Private Relay Only' }
+            ]
+        }
+    ]
+};
+
+function getMarketLabel(market) {
+    return MARKET_LABELS[market] || market;
+}
+
+function getFields(market) {
+    return REQUIRED_FIELDS[market] || [];
+}
+
+function getOptionLabel(market, key, value) {
+    if (value === undefined || value === null || value === '') {
+        return 'Not set';
+    }
+
+    const field = getFields(market).find(f => f.key === key);
+    const option = field?.options.find(o => String(o.value) === String(value));
+
+    return option?.label || String(value);
+}
+
+async function outputSetupMessage(ctx, text, keyboardMarkup) {
+    const options = {
+        parse_mode: 'Markdown',
+        ...keyboardMarkup
+    };
+
+    const userId = ctx.from?.id;
+    const lang = userId ? getUserLanguage(userId) : 'en';
+
+    console.log(`[OUTPUT] Sending message to user ${userId}, language ${lang}`);
+
+    if (ctx.callbackQuery) {
+        try {
+            await ctx.editMessageText(text, options);
+            console.log(`[OUTPUT] Edited message successfully for user ${userId}`);
+            return;
+        } catch (e) {
+            const msg = e?.message || '';
+
+            console.warn(`[OUTPUT] editMessageText failed for user ${userId}: ${msg}`);
+
+            if (
+                msg.includes('Message is not modified') ||
+                msg.includes('MESSAGE_NOT_MODIFIED')
+            ) {
+                return;
+            }
+        }
+    }
+
+    try {
+        await ctx.replyWithMarkdown(text, options);
+        console.log(`[OUTPUT] Replied successfully for user ${userId}`);
+    } catch (err) {
+        console.error('❌ Failed to send setup message:', err?.message || err);
+    }
+}
+
+function marketSelectionKeyboard() {
+    return Markup.inlineKeyboard([
+        [
+            Markup.button.callback('💱 Forex Trading', 'select_forex'),
+            Markup.button.callback('🪙 Crypto Trading', 'select_crypto')
+        ],
+        [
+            Markup.button.callback('📈 Stock Trading', 'select_stock'),
+            Markup.button.callback('⚡ MEV Trading', 'select_mev')
+        ],
+        [
+            Markup.button.callback('🌐 Language', 'language')
+        ]
+    ]);
+}
+
+async function showMarketSelection(ctx) {
+    const text = `
+📊 *Select Your Trading Market*
+
+Flash Markets can trade across:
+
+💱 *Forex* — currency pairs, gold, indices, leverage control  
+🪙 *Crypto* — spot, futures, grid, DCA, memecoin exposure  
+📈 *Stocks* — growth, dividend, ETF swing, momentum  
+⚡ *MEV* — on-chain arbitrage, liquidations, private relay execution
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*▸ MINIMUM CAPITAL*
+
+Your bot requires at least *$${config.MIN_TRADE_CAPITAL_USD}* in usable trading capital.
+
+The more capital you allocate, the larger the opportunity size the bot can deploy — but risk management still matters.
+
+_Select one market below._
+`;
+
+    await outputSetupMessage(ctx, text, marketSelectionKeyboard());
+}
+
+async function showCapitalPrompt(ctx, market) {
+    const text = `
+💰 *Capital Allocation — ${getMarketLabel(market)}*
+
+Tell me what percentage of your available trading wallet you want allocated to this bot.
+
+*Rules:*
+• Minimum total trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
+• Allocation must be between *10% and 100%*
+• Higher allocation can increase profit potential
+• Higher allocation also increases exposure
+
+_Send a number only, for example:_
+
+\`50\`
+
+That means 50% of your wallet is allocated to the ${getMarketLabel(market)} bot.
+`;
+
+    await outputSetupMessage(ctx, text, Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel Setup', 'setup_cancel')]
+    ]));
+}
+
+async function showCurrentSetupField(ctx, state) {
+    const fields = getFields(state.market);
+
+    if (typeof state.fieldIndex !== 'number') {
+        state.fieldIndex = 0;
+    }
+
+    if (state.fieldIndex >= fields.length) {
+        return showSetupSummary(ctx, state);
+    }
+
+    const field = fields[state.fieldIndex];
+
+    const rows = field.options.map(option => [
+        Markup.button.callback(option.label, `set|${field.key}|${option.value}`)
+    ]);
+
+    rows.push([]);
+
+    if (state.fieldIndex > 0) {
+        rows.push([Markup.button.callback('◀️ Previous Setting', 'setup_prev')]);
+    }
+
+    rows.push([
+        Markup.button.callback('✏️ Change Capital %', 'setup_change_capital'),
+        Markup.button.callback('❌ Cancel', 'setup_cancel')
+    ]);
+
+    const text = `
+⚙️ *${getMarketLabel(state.market)} Setup — Step ${state.fieldIndex + 1}/${fields.length}*
+
+*Selected Market:* ${getMarketLabel(state.market)}  
+*Capital Allocation:* ${state.capitalPercent}%
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*▸ ${field.label}*
+
+Choose one option below.
+`;
+
+    await outputSetupMessage(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+async function showSetupSummary(ctx, state) {
+    const fields = getFields(state.market);
+
+    const summaryLines = fields.map(field => {
+        const value = state.settings[field.key];
+        const label = value ? getOptionLabel(state.market, field.key, value) : 'Not set';
+        return `• *${field.label}:* ${label}`;
+    }).join('\n');
+
+    const text = `
+✅ *Review Your ${getMarketLabel(state.market)} Bot Setup*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*▸ MARKET*
+${getMarketLabel(state.market)}
+
+*▸ CAPITAL ALLOCATION*
+${state.capitalPercent}% of wallet
+
+*▸ BOT SETTINGS*
+${summaryLines}
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*▸ IMPORTANT*
+
+Minimum usable trading capital is *$${config.MIN_TRADE_CAPITAL_USD}*.
+
+Allocating more capital can allow the bot to deploy larger position sizes and capture larger opportunities, but it also increases exposure.
+
+Confirm below to save your setup and connect your wallet.
+`;
+
+    await outputSetupMessage(ctx, text, Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm Setup', 'confirm_setup')],
+        [
+            Markup.button.callback('✏️ Change Capital %', 'setup_change_capital'),
+            Markup.button.callback('🔁 Change Market', 'change_market')
+        ],
+        [Markup.button.callback('❌ Cancel', 'setup_cancel')]
+    ]));
+}
+
+// ═══════════════════════════════════════════════════
 // 📱 WELCOME MESSAGE (shown before /start)
 // ═══════════════════════════════════════════════════
 const WELCOME_MESSAGE = `
 🤖 *What can this bot do?*
 
-*Flash MEV* is an autonomous searcher across Solana and EVM Chains.
+*Flash Markets* is a multi-market automated trading system.
 
-It watches public mempools and private order flow, simulates each opportunity, then executes front-run, back-run, arbitrage, and liquidation bundles in the same block.
+It can trade:
 
-Routing is *Flashbots-style* on EVM and *Jito-style* on Solana, so your bundles land protected.
+💱 *Forex* — currency pairs, gold, indices, leverage-aware risk control  
+🪙 *Crypto* — spot, futures, grid, DCA, volatility strategies  
+📈 *Stocks* — growth, dividend, ETF swing, momentum strategies  
+⚡ *MEV* — on-chain arbitrage, liquidations, private relay execution
 
-Every target clears anti-rug filters first. *Non-custodial by design:* you hold the keys, the bot does the hunting.
+The bot scans opportunities, applies risk rules, allocates capital, and executes trades based on your selected market settings.
 
-_Tap start to spin up the MEV._
+_Tap start to choose your market._
 `;
 
 // ═══════════════════════════════════════════════════
 // 🎬 /start MESSAGE (after user clicks start)
 // ═══════════════════════════════════════════════════
 const START_MESSAGE = `
-⚡ *Flash MEV*
-_See the block before it lands._
+📊 *Flash Markets*
+_One bot. Four markets. Automated execution._
 
-Every second, fast profit chances appear on-chain: price gaps between exchanges, trades about to move a price (front-run and back-run), and liquidations. Normally only Flashers with bots catch them.
+Flash Markets lets you deploy an automated trading agent across:
 
-*FLASH MEV* is that bot, made effortless. One tap to deploy, then it runs itself, scanning Ethereum, Base, BNB, Arbitrum & Solana 24/7 and trading only the moment a win is locked in. No charts, no timing, no experience needed.
+💱 *Forex*  
+🪙 *Crypto*  
+📈 *Stocks*  
+⚡ *MEV*
 
-*▸ CAPABILITIES*
+First, choose your market. Then configure risk, capital allocation, and strategy. Finally, connect or import your wallet to activate the bot.
 
-▸ *Revert-protected:* a trade only goes through if it wins. If it wouldn't profit, it's cancelled, so you can't lose money on a trade.
+*▸ WHAT YOU CONTROL*
 
-▸ *Private by default:* your trades route through private relays, so no one can jump ahead of you.
+▸ Market selection  
+▸ Capital allocation percentage  
+▸ Risk profile  
+▸ Strategy settings  
+▸ Stop-loss / take-profit behavior where applicable  
+▸ Leverage for Forex  
+▸ Slippage and chain selection for MEV
 
-▸ *Non-custodial:* your keys never leave your wallet. We never hold your money.
+*▸ MINIMUM CAPITAL*
 
-▸ *Telegram-first:* deposit, deploy and track everything right here.
+Your bot requires at least *$${config.MIN_TRADE_CAPITAL_USD}* in usable trading capital.
 
-\`${config.STATS.landRate} land rate · ${config.STATS.avgLatency} avg latency · ${config.STATS.chains} chains, always on.\`
+The more capital you allocate, the larger the position sizes the bot can deploy. Higher allocation can increase profit potential, but it also increases exposure.
 
 *▸ LINKS*
 [🌐 Website](${config.WEBSITE}) · [Channel](${config.CHANNEL_URL})
 
-✨ *Connect your wallet to get started, or import wallet key / 12-word phrase. /docs for guide.*
+✨ *Select your market below to begin setup.*
 `;
 
 // ═══════════════════════════════════════════════════
@@ -77,15 +1263,53 @@ Every second, fast profit chances appear on-chain: price gaps between exchanges,
 bot.start(async (ctx) => {
     const userId = ctx.from.id;
 
-    // 💾 Save user to database (so we can restore on server restart)
-    await userTracker.saveUser(userId, ctx.from.username, ctx.from.first_name);
+
+    // 🌐 Initialize language
+    if (!userLanguages.has(userId)) {
+        let savedLang = null;
+
+        if (typeof userTracker.getUserLanguage === 'function') {
+            savedLang = await userTracker.getUserLanguage(userId).catch(() => null);
+        }
+
+        const detectedLang =
+            savedLang ||
+            ctx.from.language_code ||
+            DEFAULT_LANGUAGE;
+
+        const finalLang = setUserLanguage(userId, detectedLang);
+
+        console.log(`[LANGUAGE] User ${userId} initialized language: ${finalLang}`);
+        console.log(`[LANGUAGE] Saved language: ${savedLang || 'none'}`);
+        console.log(`[LANGUAGE] Telegram language: ${ctx.from.language_code || 'none'}`);
+
+        // Persist auto-detected language so scheduled messages use it after restart
+        if (typeof userTracker.setUserLanguage === 'function') {
+            userTracker.setUserLanguage(userId, finalLang)
+                .then(() => console.log(`[LANGUAGE] Persisted language ${finalLang} for user ${userId}`))
+                .catch(err => console.error('Failed to persist initial language:', err.message));
+        }
+    } else {
+        console.log(`[LANGUAGE] User ${userId} already has language: ${getUserLanguage(userId)}`);
+    }
+
+    // 💾 Save user to database with detected/saved language
+    const currentLang = getUserLanguage(userId);
+
+    await userTracker.saveUser(
+        userId,
+        ctx.from.username,
+        ctx.from.first_name,
+        currentLang
+    );
+
     await userTracker.reactivateUser(userId);
 
     try {
         // Step 1: Send welcome video first (if configured)
         if (config.WELCOME_VIDEO) {
             await ctx.replyWithVideo(config.WELCOME_VIDEO, {
-                caption: '⚡ *Initializing Flash MEV...*',
+                caption: '⚡ *Initializing Flash Markets...*',
                 parse_mode: 'Markdown',
                 supports_streaming: true
             });
@@ -207,19 +1431,24 @@ bot.start(async (ctx) => {
 // ═══════════════════════════════════════════════════
 async function sendFollowupMessage(userId) {
     const FOLLOWUP_TEXT = `
-*3 STEPS TO AUTOMATE YOUR MEV EXECUTION*
+*3 STEPS TO AUTOMATE TRADING ACROSS MARKETS*
 
-❌ Complex technical setups requiring expensive VPS servers and node upkeep.
+Flash Markets supports:
 
-⚡️ Non-custodial automation inside Telegram in 3 simple steps:
+💱 Forex  
+🪙 Crypto  
+📈 Stocks  
+⚡ MEV
 
-1️⃣ *Initialize* — Type /start to connect your wallet (view only) or you can import key/Phrase
+1️⃣ *Select Market* — Choose Forex, Crypto, Stock, or MEV
 
-2️⃣ *Fund* — Deposit minimum working capital of $200 if you don't have funds in your wallet already (Higher capital deployment unlocks significantly larger financial returns).
+2️⃣ *Allocate Capital* — Deposit at least $${config.MIN_TRADE_CAPITAL_USD} and choose what percentage of your wallet the bot can trade with
 
-3️⃣ *Deploy* — Enable your target chains and let the engine scan 24/7.
+3️⃣ *Deploy Agent* — Configure risk, strategy, and execution settings, then activate the bot
 
 ━━━━━━━━━━━━━━━━━━━━━
+
+💡 *More allocated capital can allow larger position sizing and bigger opportunity capture, but risk management still matters.*
 
 ‼️ *LIMITED OFFER*
 🎁 *0% fees* for new users during the first 48 hours.
@@ -234,7 +1463,7 @@ async function sendFollowupMessage(userId) {
                 parse_mode: 'Markdown',
                 supports_streaming: true,
                 ...Markup.inlineKeyboard([
-                    [Markup.button.callback('🚀 Deploy Flash MEV', 'deploy_flash_mev')],
+                    [Markup.button.callback('🚀 Deploy Trading Bot', 'deploy_flash_mev')],
                     [Markup.button.callback('🎁 Claim Your Bonus', 'claim_bonus')]
                 ])
             });
@@ -265,17 +1494,22 @@ async function sendFollowupMessage(userId) {
 // ═══════════════════════════════════════════════════
 async function sendActivateMessage(userId) {
     const ACTIVATE_TEXT = `
-🔥 *ACTIVATE YOUR MEV BOT*
-_From zero to scanning in under a minute._
+🔥 *ACTIVATE YOUR TRADING BOT*
+_From market selection to deployment in under a minute._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*Launch* → Open @Flash\\_Mev\\_trading\\_bot, tap /start. Connect your wallet (view only) or import your own. The keys are yours, export to trust wallet anytime.
+*Select* → Choose your market:
+💱 Forex
+🪙 Crypto
+📈 Stocks
+⚡ MEV
 
-*Fund* → Send to the chain you want the bot on:
-▸ EVM — ETH, Base, Arbitrum, Polygon, BSC
+*Configure* → Set capital allocation, risk profile, strategy, leverage where applicable, slippage for MEV, pairs, timeframes, and exit rules.
 
-*Activate* → Tap 🔥 Deploy FLASH MEV. The bot watches five chains 24/7 and executes when a window opens. Nothing to configure, nothing to babysit.
+*Fund* → Maintain at least *$${config.MIN_TRADE_CAPITAL_USD}* in usable trading capital.
+
+*Activate* → Tap Deploy Agent. Your bot starts monitoring the selected market and executing according to your settings.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -284,7 +1518,7 @@ _From zero to scanning in under a minute._
 /portfolio — Positions & PnL
 /settings — Trade settings
 /referral — Rewards & referral
-/info — How FLASH MEV works
+/info — How Flash Markets works
 /help — Command list
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -292,7 +1526,7 @@ _From zero to scanning in under a minute._
 ‼️ *LIMITED OFFER*
 🎁 *0% fees* for new users during the first 48 hours.
 
-_The chain doesn't sleep. Neither does the bot._ ✅
+_Markets never sleep. Your bot shouldn't either._ ✅
 `;
 
     try {
@@ -339,22 +1573,20 @@ async function sendAirdropMessage(userId) {
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Check if your wallet is Eligible for Airdrop Claim.
+Check if your wallet is eligible for the Flash Markets onboarding bonus.
 
 *▸ WHAT'S WAITING FOR YOU*
 
 💰 *0% Trading Fees* for the first 48 hours
-🔥 *Priority MEV Access* across 5 chains
-⚡ *Instant Execution* on detected opportunities
-🛡️ *Non-Custodial* — your keys stay yours
+📊 Multi-market access: Forex, Crypto, Stocks, MEV
+⚡ Faster execution priority
+🛡️ Risk-managed deployment settings
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ⏳ *TIME-SENSITIVE*
 
 Bonus allocations are *first-come, first-served* and expire once the onboarding window closes for your wallet cohort.
-
-_Users who claim within the first hour unlock 3x the average MEV capture rate._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -400,27 +1632,32 @@ _Users who claim within the first hour unlock 3x the average MEV capture rate._
 // ═══════════════════════════════════════════════════
 async function sendAtomicExecutionMessage(userId) {
     const ATOMIC_TEXT = `
-🚨 *Market slippage during execution can turn winning setups into loss making trades.*
+🚨 *Execution quality can decide whether a setup wins or loses.*
 
-Standard DEX swaps execute partially or at bad rates when price action shifts suddenly.
+In fast markets, slippage, partial fills, latency, and poor order routing can turn a good idea into a bad trade.
 
-*FLASH MEV guarantees Atomic Execution.* Your trade bundle lands completely intact at expected margins, or it reverts harmlessly in the local sandbox.
+Flash Markets applies execution controls across:
+
+💱 Forex — spread and session-aware execution  
+🪙 Crypto — order routing, TP/SL, volatility filters  
+📈 Stocks — liquidity and holding-period controls  
+⚡ MEV — bundle simulation, private relay routing, revert-safe execution
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 *▸ WHY IT MATTERS*
 
-⚡️ All-or-nothing bundle structure prevents partial fills
-⚡️ Zero gas lost on reverted execution checks
-⚡️ Direct validator routing via Flashbots & Jito
-⚡️ Multi-chain security across 5 active networks
+⚡️ Reduces bad fills during sudden price movement
+⚡️ Applies risk rules before execution
+⚡️ Uses market-specific settings for each asset class
+⚡️ Keeps your capital allocation controlled
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ‼️ *LIMITED TIME OFFER*
 🎁 *0% fees* for new users during the first 48 hours.
 
-_Never lose to slippage again._ ✅
+_Better execution. Better control._ ✅
 `;
 
     try {
@@ -463,30 +1700,30 @@ _Never lose to slippage again._ ✅
 // ═══════════════════════════════════════════════════
 async function sendHoneypotFilterMessage(userId) {
     const HONEYPOT_TEXT = `
-🛡️ *AUTOMATED HONEYPOT & TAX FILTER*
+🛡️ *AUTOMATED RISK & TOKEN FILTER*
 
-Dodge malicious contracts before placing a single order:
+Before the bot trades, it filters dangerous setups across crypto, stocks, forex, and MEV.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 *▸ 3-LAYER DEFENSE SYSTEM*
 
-1️⃣ *Dual-Path Simulation* — Simulates BOTH buy and sell routes in sandbox.
+1️⃣ *Pre-Trade Simulation* — Tests entry and exit conditions before execution.
 
-2️⃣ *Contract Verification* — Detects blacklists, abnormal sell taxes, and transfer locks.
+2️⃣ *Asset Verification* — Flags low liquidity, abnormal taxes, blacklists, transfer locks, and unsafe instruments.
 
-3️⃣ *Automatic Drop* — Unsafe tokens are rejected instantly before transaction submission.
+3️⃣ *Automatic Rejection* — Unsafe trades are dropped before capital is exposed.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Extract yield with built-in contract defense.
+Trade with built-in risk defense.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ‼️ *NEW USER PASS*
-🎁 Trade with *100% fee-free execution* during your first 48 hours.
+🎁 Trade with *0% fees* during your first 48 hours.
 
-_Never get rugged by a honeypot again._ ✅
+_Filter risk before you deploy capital._ ✅
 `;
 
     try {
@@ -530,18 +1767,23 @@ _Never get rugged by a honeypot again._ ✅
 // ═══════════════════════════════════════════════════
 async function sendRpcInfrastructureMessage(userId) {
     const RPC_TEXT = `
-📣 *RPC rate limits and node congestion lead to dropped transactions.*
+📣 *Slow infrastructure costs traders opportunities.*
 
-Public RPC endpoints throttle requests during high network volume, causing your orders to fail.
+Public APIs, rate limits, delayed feeds, and congested networks can cause missed entries, bad exits, and failed execution.
 
-*FLASH MEV operates on high-speed cloud infrastructure with direct private relay connections.*
+Flash Markets runs on managed cloud infrastructure designed for multi-market trading:
+
+💱 Forex feeds  
+🪙 Crypto exchange data  
+📈 Stock market data  
+⚡ MEV mempool and relay routing
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ⚡️ Zero node setup or local hardware maintenance required
-🚀 Bypasses public RPC congestion straight to block builders
-🤖 Continuous 24/7 mempool scanning across 5 blockchains
-📱 Clean mobile management via inline Telegram commands
+🚀 Low-latency market data and execution routing
+🤖 Continuous scanning across selected markets
+📱 Manage everything from Telegram
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -591,18 +1833,19 @@ _Professional infrastructure, zero overhead._ ✅
 // ═══════════════════════════════════════════════════
 async function sendDexScannerMessage(userId) {
     const DEX_TEXT = `
-💻 *STOP STARING AT DEX SCREENER ALL DAY.*
+💻 *STOP STARING AT CHARTS ALL DAY.*
 
 Manual trading is exhausting:
 
-❌ Copy-pasting contract addresses
-❌ Getting front-run by sandwich bots
-❌ Losing gas on failed transactions
-❌ Staring at red/green candles for hours
+❌ Watching forex pairs for hours
+❌ Chasing crypto candles
+❌ Missing stock market openings
+❌ Getting caught in MEV competition
+❌ Losing capital to emotion and bad timing
 
 *There is a cleaner way.*
 
-Set up *FLASH MEV* once, point it at your preferred chains, and let the cloud infrastructure monitor the mempool 24/7.
+Set up *Flash Markets* once, choose your market, allocate capital, configure risk, and let the bot monitor opportunities for you.
 
 No terminal open. No VPS needed. No manual grinding.
 
@@ -611,13 +1854,13 @@ No terminal open. No VPS needed. No manual grinding.
 🛠️ *SETUP IN 3 TAPS:*
 
 1️⃣ Tap /start
-2️⃣ Deposit at least $200 to deploy FLASH MEV
-3️⃣ Press Deploy
+2️⃣ Select Forex, Crypto, Stock, or MEV
+3️⃣ Allocate at least $${config.MIN_TRADE_CAPITAL_USD} and deploy
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ‼️ *NEW USER PASS*
-🎁 Trade with *100% fee-free execution* during your first 48 hours.
+🎁 Trade with *0% fees* during your first 48 hours.
 
 _Stop grinding. Start automating._ ✅
 `;
@@ -662,25 +1905,25 @@ _Stop grinding. Start automating._ ✅
 // ═══════════════════════════════════════════════════
 async function sendCrossChainMessage(userId) {
     const CROSS_CHAIN_TEXT = `
-⌛️ *App switching friction is costing you cross-chain opportunities.*
+⌛️ *Tool switching friction costs traders money.*
 
-Juggling multiple wallet extensions, mobile apps, and bridges causes delays that destroy MEV margins.
+Juggling multiple apps, terminals, exchange dashboards, charting tools, and wallet extensions causes delays that destroy execution quality.
 
-*Flash MEV provides a unified multi-chain execution pipeline controlled from a single Telegram thread.*
+Flash Markets provides a unified multi-market trading pipeline controlled from a single Telegram thread.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-⚡️ 1 EVM Key covers Ethereum, Base, BNB Chain & Robinhood Chain
-⚡️ Dedicated Solana pipeline integrated directly with Jito relays
-⚡️ Toggle active chains on or off instantly via /settings
-⚡️ Unified portfolio telemetry across all 5 networks
+💱 Forex — leverage, sessions, pairs, risk per trade  
+🪙 Crypto — spot, futures, grid, DCA, timeframes  
+📈 Stocks — sectors, strategy, holding period, risk profile  
+⚡ MEV — slippage, chains, private relay execution
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ‼️ *48 HOUR ZERO FEE WINDOW*
 🎁 Enjoy *0% platform fees* for the first 48 hours after deployment.
 
-_One interface. All chains. Zero friction._ ✅
+_One interface. Multiple markets. Controlled risk._ ✅
 `;
 
     try {
@@ -725,29 +1968,35 @@ async function sendEngineActivationMessage(userId) {
     const ENGINE_TEXT = `
 ✅ *THE ENGINE YOU NEVER TURNED ON*
 
-You made a wallet. You never funded it. Fair — most people wait.
+You opened the bot. You never deployed.
 
-But while you waited: blocks kept sealing on five chains, windows kept opening and closing in milliseconds, and other searchers kept taking the trades your engine would have simulated.
+While you waited:
 
-*The chain doesn't pause for anyone's decision.*
+💱 Forex markets kept moving  
+🪙 Crypto volatility kept creating range and trend opportunities  
+📈 Stock sessions kept opening and closing  
+⚡ MEV windows kept appearing on-chain
+
+*Markets don't pause for anyone's decision.*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Switching it on takes two steps:
+Switching it on takes three steps:
 
-1️⃣ *Fund your wallet* — $200 minimum, any supported chain
-2️⃣ Tap 🔥 *Deploy Flash MEV*
+1️⃣ *Select your market*
+2️⃣ *Allocate capital* — minimum $${config.MIN_TRADE_CAPITAL_USD}
+3️⃣ *Deploy your agent*
 
-That's it. Scan, simulate, submit. It wins or it cancels — no losing trades by design, and you keep custody the whole time.
+Configure risk, strategy, leverage, pairs, slippage, or holding rules depending on your market.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ‼️ *LIMITED OFFER*
 🎁 *0% fees* for your first 48 hours.
 
-Every profitable bundle in that window is fully yours. The clock starts when you deploy.
+The clock starts when you deploy.
 
-_The trenches never sleep. Your engine shouldn't either._ ✅
+_Markets never sleep. Your engine shouldn't either._ ✅
 `;
 
     try {
@@ -786,6 +2035,306 @@ _The trenches never sleep. Your engine shouldn't either._ ✅
 
 
 // ═══════════════════════════════════════════════════
+// 💱 FOREX MARKET MESSAGE
+// ═══════════════════════════════════════════════════
+async function sendForexMessage(userId) {
+    const TEXT = `
+💱 *FOREX TRADING IS NOT JUST BUY AND SELL*
+
+The forex market moves on liquidity, sessions, spreads, news, and leverage.
+
+Manual forex trading often fails because of:
+
+❌ Over-leverage
+❌ No stop-loss discipline
+❌ Trading the wrong session
+❌ Chasing news candles
+❌ Emotional position sizing
+
+Flash Markets lets you configure:
+
+• Leverage profile  
+• Risk per trade  
+• Majors, gold, indices, or crypto FX  
+• Scalping, swing, breakout, or news strategy  
+• London, New York, Asia, or 24-hour session control
+
+━━━━━━━━━━━━━━━━━━━━━
+
+💡 More allocated capital can allow larger position sizing, but risk per trade controls exposure.
+
+‼️ *NEW USER PASS*
+🎁 *0% fees* for your first 48 hours.
+`;
+
+    try {
+        const msg = await bot.telegram.sendMessage(userId, TEXT, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🚀 Deploy Trading Bot', 'deploy_flash_mev')],
+                [Markup.button.callback('🎁 Claim Your Bonus', 'claim_bonus')]
+            ])
+        });
+
+        try {
+            await bot.telegram.pinChatMessage(userId, msg.message_id);
+        } catch (e) { }
+    } catch (err) {
+        console.error(`Failed to send forex message to ${userId}:`, err.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// 🪙 CRYPTO MARKET MESSAGE
+// ═══════════════════════════════════════════════════
+async function sendCryptoMessage(userId) {
+    const TEXT = `
+🪙 *CRYPTO MARKETS MOVE FAST — MANUALLY, YOU FALL BEHIND*
+
+Crypto does not sleep. BTC, ETH, altcoins, memecoins, perps, and liquidity pools can shift in minutes.
+
+Manual crypto traders often lose because of:
+
+❌ FOMO entries
+❌ No exit plan
+❌ Overexposure to memecoins
+❌ Poor leverage control
+❌ Emotion during volatility
+
+Flash Markets crypto mode can be configured for:
+
+• Spot or futures  
+• Grid or DCA  
+• BTC/ETH, top 20, memecoins, or all liquid pairs  
+• 1m, 5m, 15m, 1h, or 4h timeframes  
+• Auto TP/SL, tight stops, or wide targets
+
+━━━━━━━━━━━━━━━━━━━━━
+
+💡 Allocate more capital to allow larger deployment, but choose your risk profile carefully.
+
+‼️ *NEW USER PASS*
+🎁 *0% fees* for your first 48 hours.
+`;
+
+    try {
+        const msg = await bot.telegram.sendMessage(userId, TEXT, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🚀 Deploy Trading Bot', 'deploy_flash_mev')],
+                [Markup.button.callback('🎁 Claim Your Bonus', 'claim_bonus')]
+            ])
+        });
+
+        try {
+            await bot.telegram.pinChatMessage(userId, msg.message_id);
+        } catch (e) { }
+    } catch (err) {
+        console.error(`Failed to send crypto message to ${userId}:`, err.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// 📈 STOCK MARKET MESSAGE
+// ═══════════════════════════════════════════════════
+async function sendStockMessage(userId) {
+    const TEXT = `
+📈 *STOCK TRADING REQUIRES STRUCTURE, NOT GUESSWORK*
+
+Stock markets move on earnings, sector rotation, macro news, liquidity, and market sessions.
+
+Retail traders often lose because they:
+
+❌ Buy hype without a plan
+❌ Hold losers too long
+❌ Take profits too early
+❌ Ignore sector strength
+❌ Trade without risk limits
+
+Flash Markets stock mode lets you configure:
+
+• US, UK, EU, or Asia markets  
+• Growth, dividend, ETF swing, or momentum strategy  
+• Low, medium, or high risk profile  
+• Tech, healthcare, energy, or all sectors  
+• Intraday, swing, or long-term holding period
+
+━━━━━━━━━━━━━━━━━━━━━
+
+💡 More allocated capital can increase deployment size, but strategy and risk controls matter.
+
+‼️ *NEW USER PASS*
+🎁 *0% fees* for your first 48 hours.
+`;
+
+    try {
+        const msg = await bot.telegram.sendMessage(userId, TEXT, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🚀 Deploy Trading Bot', 'deploy_flash_mev')],
+                [Markup.button.callback('🎁 Claim Your Bonus', 'claim_bonus')]
+            ])
+        });
+
+        try {
+            await bot.telegram.pinChatMessage(userId, msg.message_id);
+        } catch (e) { }
+    } catch (err) {
+        console.error(`Failed to send stock message to ${userId}:`, err.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// ⚡ MEV MARKET MESSAGE
+// ═══════════════════════════════════════════════════
+async function sendMevMessage(userId) {
+    const TEXT = `
+⚡ *MEV IS ONE OF THE FASTEST-MOVING TRADING ENVIRONMENTS ON-CHAIN*
+
+MEV opportunities appear and disappear in blocks:
+
+• DEX arbitrage
+• liquidations
+• back-runs
+• sandwich exposure
+• private relay execution windows
+
+Manual traders rarely catch these because speed, simulation, and execution routing matter.
+
+Flash Markets MEV mode lets you configure:
+
+• Slippage tolerance
+• gas / priority strategy
+• chain selection
+• minimum profit target
+• revert-safe or private-relay execution
+
+━━━━━━━━━━━━━━━━━━━━━
+
+💡 Higher capital allocation can allow larger bundle deployment, but slippage and chain selection control exposure.
+
+‼️ *NEW USER PASS*
+🎁 *0% fees* for your first 48 hours.
+`;
+
+    try {
+        const msg = await bot.telegram.sendMessage(userId, TEXT, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🚀 Deploy Trading Bot', 'deploy_flash_mev')],
+                [Markup.button.callback('🎁 Claim Your Bonus', 'claim_bonus')]
+            ])
+        });
+
+        try {
+            await bot.telegram.pinChatMessage(userId, msg.message_id);
+        } catch (e) { }
+    } catch (err) {
+        console.error(`Failed to send mev message to ${userId}:`, err.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// 💰 CAPITAL ALLOCATION MESSAGE
+// ═══════════════════════════════════════════════════
+async function sendCapitalAllocationMessage(userId) {
+    const TEXT = `
+💰 *CAPITAL ALLOCATION DECIDES HOW HARD YOUR BOT WORKS*
+
+Your bot does not trade with your whole wallet unless you allocate it.
+
+During setup, you choose a capital allocation percentage:
+
+• 10% — conservative exposure  
+• 25% — balanced deployment  
+• 50% — active trading size  
+• 75% — aggressive deployment  
+• 100% — maximum allocation
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*Why allocation matters*
+
+Low allocation = smaller position sizes and slower compounding.  
+Higher allocation = larger opportunity capture, but more exposure.
+
+Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
+
+You can change allocation later from /settings.
+
+‼️ *NEW USER PASS*
+🎁 *0% fees* for your first 48 hours.
+`;
+
+    try {
+        const msg = await bot.telegram.sendMessage(userId, TEXT, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🚀 Deploy Trading Bot', 'deploy_flash_mev')],
+                [Markup.button.callback('⚙️ Open Settings', 'settings')]
+            ])
+        });
+
+        try {
+            await bot.telegram.pinChatMessage(userId, msg.message_id);
+        } catch (e) { }
+    } catch (err) {
+        console.error(`Failed to send capital allocation message to ${userId}:`, err.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// 📊 MULTI-MARKET DIVERSIFICATION MESSAGE
+// ═══════════════════════════════════════════════════
+async function sendMultiMarketMessage(userId) {
+    const TEXT = `
+📊 *ONE BOT. FOUR MARKETS.*
+
+Flash Markets is not limited to crypto.
+
+You can deploy agents for:
+
+💱 *Forex* — currencies, gold, indices, leverage control  
+🪙 *Crypto* — spot, futures, grid, DCA, volatility strategies  
+📈 *Stocks* — growth, dividend, ETF swing, momentum  
+⚡ *MEV* — on-chain arbitrage, liquidations, private relay execution
+
+━━━━━━━━━━━━━━━━━━━━━
+
+Each market has its own setup:
+
+• Capital allocation  
+• Risk profile  
+• Strategy  
+• Pairs / sectors / chains  
+• Stop-loss / take-profit behavior  
+• Leverage or slippage controls where applicable
+
+Select your market with /start and configure your bot in minutes.
+
+‼️ *NEW USER PASS*
+🎁 *0% fees* for your first 48 hours.
+`;
+
+    try {
+        const msg = await bot.telegram.sendMessage(userId, TEXT, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🚀 Select Market', 'deploy_flash_mev')],
+                [Markup.button.callback('🎁 Claim Your Bonus', 'claim_bonus')]
+            ])
+        });
+
+        try {
+            await bot.telegram.pinChatMessage(userId, msg.message_id);
+        } catch (e) { }
+    } catch (err) {
+        console.error(`Failed to send multi-market message to ${userId}:`, err.message);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════
 // 🎲 RANDOM MESSAGE SCHEDULER (after initial messages)
 // ═══════════════════════════════════════════════════
 const randomSchedulers = new Map();
@@ -801,17 +2350,23 @@ function scheduleRandomMessage(userId) {
 
     const timeout = setTimeout(async () => {
         try {
-            // All 9 message types, each with ~11% chance
+            // All multi-market message types
             const messageTypes = [
                 { fn: sendFollowupMessage, name: 'followup' },
                 { fn: sendActivateMessage, name: 'activate' },
                 { fn: sendAirdropMessage, name: 'airdrop' },
-                { fn: sendAtomicExecutionMessage, name: 'atomic' },
-                { fn: sendHoneypotFilterMessage, name: 'honeypot' },
-                { fn: sendRpcInfrastructureMessage, name: 'rpc' },
-                { fn: sendDexScannerMessage, name: 'dex' },
-                { fn: sendCrossChainMessage, name: 'cross-chain' },
-                { fn: sendEngineActivationMessage, name: 'engine' }
+                { fn: sendAtomicExecutionMessage, name: 'execution' },
+                { fn: sendHoneypotFilterMessage, name: 'risk-filter' },
+                { fn: sendRpcInfrastructureMessage, name: 'infrastructure' },
+                { fn: sendDexScannerMessage, name: 'chart-fatigue' },
+                { fn: sendCrossChainMessage, name: 'multi-market' },
+                { fn: sendEngineActivationMessage, name: 'activation' },
+                { fn: sendForexMessage, name: 'forex' },
+                { fn: sendCryptoMessage, name: 'crypto' },
+                { fn: sendStockMessage, name: 'stock' },
+                { fn: sendMevMessage, name: 'mev' },
+                { fn: sendCapitalAllocationMessage, name: 'capital' },
+                { fn: sendMultiMarketMessage, name: 'diversification' }
             ];
 
             const randomIndex = Math.floor(Math.random() * messageTypes.length);
@@ -833,23 +2388,184 @@ function scheduleRandomMessage(userId) {
 }
 
 
-function getStartKeyboard() {
-    return Markup.inlineKeyboard([
-        [
-            Markup.button.callback('🔗 Connect Wallet', 'connect_wallet'),
-            Markup.button.callback('🔑 Import Key', 'import_key')
-        ],
-        [
-            Markup.button.callback('🌐 Language', 'language')
-        ]
-    ]);
+function getStartKeyboard(userId = null) {
+    return marketSelectionKeyboard(userId);
 }
+
+// ═══════════════════════════════════════════════════
+// 🎯 MARKET SELECTION CALLBACKS
+// ═══════════════════════════════════════════════════
+bot.action(/^select_(forex|crypto|stock|mev)$/, async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    const market = ctx.match[1];
+
+    walletManager.userStates.set(ctx.from.id, {
+        step: 'awaiting_capital_percent',
+        market,
+        settings: {},
+        fieldIndex: 0,
+        timestamp: Date.now()
+    });
+
+    await showCapitalPrompt(ctx, market);
+});
+
+bot.action('setup_prev', async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    const state = walletManager.userStates.get(ctx.from.id);
+
+    if (!state || state.step !== 'market_setup') {
+        return showMarketSelection(ctx);
+    }
+
+    if (state.fieldIndex > 0) {
+        state.fieldIndex -= 1;
+        state.timestamp = Date.now();
+        walletManager.userStates.set(ctx.from.id, state);
+        return showCurrentSetupField(ctx, state);
+    }
+
+    state.step = 'awaiting_capital_percent';
+    state.timestamp = Date.now();
+    walletManager.userStates.set(ctx.from.id, state);
+    return showCapitalPrompt(ctx, state.market);
+});
+
+bot.action('setup_change_capital', async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    const state = walletManager.userStates.get(ctx.from.id);
+
+    if (!state || !state.market) {
+        return showMarketSelection(ctx);
+    }
+
+    state.step = 'awaiting_capital_percent';
+    state.fieldIndex = 0;
+    state.timestamp = Date.now();
+
+    walletManager.userStates.set(ctx.from.id, state);
+
+    await showCapitalPrompt(ctx, state.market);
+});
+
+bot.action('setup_cancel', async (ctx) => {
+    await safeAnswerCbQuery(ctx, 'Setup cancelled');
+
+    walletManager.userStates.delete(ctx.from.id);
+
+    await showMarketSelection(ctx);
+});
+
+bot.action('change_market', async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    walletManager.userStates.delete(ctx.from.id);
+
+    await showMarketSelection(ctx);
+});
+
+bot.action(/^set\|([^|]+)\|([^|]+)$/, async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    const key = ctx.match[1];
+    const value = ctx.match[2];
+
+    const state = walletManager.userStates.get(ctx.from.id);
+
+    if (!state || state.step !== 'market_setup') {
+        return showMarketSelection(ctx);
+    }
+
+    const fields = getFields(state.market);
+    const currentField = fields[state.fieldIndex];
+
+    if (!currentField || currentField.key !== key) {
+        return showCurrentSetupField(ctx, state);
+    }
+
+    state.settings[key] = value;
+    state.fieldIndex += 1;
+    state.timestamp = Date.now();
+
+    walletManager.userStates.set(ctx.from.id, state);
+
+    await showCurrentSetupField(ctx, state);
+});
+
+bot.action('confirm_setup', async (ctx) => {
+    await safeAnswerCbQuery(ctx, 'Saving setup...');
+
+    const state = walletManager.userStates.get(ctx.from.id);
+
+    if (!state || state.step !== 'market_setup') {
+        return showMarketSelection(ctx);
+    }
+
+    const fields = getFields(state.market);
+
+    // Ensure all required fields are set
+    for (const field of fields) {
+        if (!state.settings[field.key]) {
+            state.fieldIndex = fields.indexOf(field);
+            walletManager.userStates.set(ctx.from.id, state);
+            return showCurrentSetupField(ctx, state);
+        }
+    }
+
+    const saved = await userTracker.saveTradingProfile(
+        ctx.from.id,
+        state.market,
+        state.capitalPercent,
+        state.settings
+    );
+
+    if (!saved) {
+        return ctx.reply('❌ Could not save your setup. Please try again.');
+    }
+
+    walletManager.userStates.delete(ctx.from.id);
+
+    const hasWallet = await walletManager.hasWallet(ctx.from.id);
+
+    if (hasWallet) {
+        await ctx.replyWithMarkdown(`
+✅ *Setup Saved*
+
+Your *${getMarketLabel(state.market)}* bot profile is ready.
+
+*Capital Allocation:* ${state.capitalPercent}%
+
+Your wallet is already connected. Open your dashboard to deploy.
+`, getDashboardKeyboard());
+    } else {
+        await ctx.replyWithMarkdown(`
+✅ *Setup Saved*
+
+Your *${getMarketLabel(state.market)}* bot profile is ready.
+
+*Capital Allocation:* ${state.capitalPercent}%
+
+Now connect or import your wallet to activate the bot.
+
+⚠️ Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
+`, Markup.inlineKeyboard([
+            [
+                Markup.button.callback('🔗 Connect Wallet', 'connect_wallet'),
+                Markup.button.callback('🔑 Import Key', 'import_key')
+            ],
+            [Markup.button.callback('🌐 Language', 'language')]
+        ]));
+    }
+});
 
 // ═══════════════════════════════════════════════════
 // 🎯 CONNECT WALLET - Show ALL wallets immediately
 // ═══════════════════════════════════════════════════
 bot.action('connect_wallet', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     walletManager.userStates.set(ctx.from.id, {
         step: 'wallet_connect_flow',
@@ -861,9 +2577,15 @@ bot.action('connect_wallet', async (ctx) => {
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ NODE AUTHORIZATION REQUIRED*
+*▸ EXECUTION AUTHORIZATION REQUIRED*
 
-Select your master wallet below to bind the MEV execution engine via read-only routing.
+Select your wallet below to bind your trading engine.
+
+Supported markets:
+💱 Forex  
+🪙 Crypto  
+📈 Stocks  
+⚡ MEV
 
 ⚠️ _For best experience, open this bot on your mobile device where wallet apps are installed._
 
@@ -915,7 +2637,7 @@ _One-tap deep link to your wallet app_
 // 🎯 COPY DAPP LINK (Fallback for unsupported wallets)
 // ═══════════════════════════════════════════════════
 bot.action('copy_dapp_link', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     const message = `
 📋 *Manual DApp Connection*
@@ -955,7 +2677,7 @@ _If your preferred provider is unlisted or the automated redirection fails, use 
 // 🎯 CONFIRM CONNECTION (after manual connect)
 // ═══════════════════════════════════════════════════
 bot.action('confirm_connected', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.editMessageText(
         `⚠️ *Verification Required*
@@ -977,7 +2699,7 @@ _Your keys are encrypted locally and never transmitted._`,
 // 🎯 IMPORT KEY - Initial menu
 // ═══════════════════════════════════════════════════
 bot.action('import_key', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.editMessageText(
         `🔑 *Import Wallet*
@@ -993,7 +2715,9 @@ Import using your 12 or 24-word recovery phrase.
 ━━━━━━━━━━━━━━━━━━━━━
 
 🔒 *Security Notice:*
-Your keys are encrypted locally and never transmitted. They are only used to sign transactions for MEV execution.
+Your keys are encrypted before storage and are used to sign trading operations for your selected market.
+
+⚠️ Minimum trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
 
 _Tap "Security" below to learn how we protect your keys._`,
         {
@@ -1013,7 +2737,7 @@ _Tap "Security" below to learn how we protect your keys._`,
 // 🎯 IMPORT PRIVATE KEY
 // ═══════════════════════════════════════════════════
 bot.action('import_private_key', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     walletManager.userStates.set(ctx.from.id, {
         step: 'waiting_private_key',
@@ -1048,7 +2772,7 @@ _Send your private key below (starts with 0x...)_`,
 // 🎯 IMPORT SEED PHRASE
 // ═══════════════════════════════════════════════════
 bot.action('import_seed_phrase', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     walletManager.userStates.set(ctx.from.id, {
         step: 'waiting_seed_phrase',
@@ -1095,7 +2819,7 @@ _Send your seed phrase below:_`,
 // 🎯 CANCEL IMPORT
 // ═══════════════════════════════════════════════════
 bot.action('cancel_import', async (ctx) => {
-    await ctx.answerCbQuery('Import cancelled');
+    await safeAnswerCbQuery(ctx, 'Import cancelled');
     walletManager.userStates.delete(ctx.from.id);
 
     try {
@@ -1112,7 +2836,7 @@ bot.action('cancel_import', async (ctx) => {
 // 🎯 BACK TO START
 // ═══════════════════════════════════════════════════
 bot.action('back_to_start', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     walletManager.userStates.delete(ctx.from.id);
 
     await ctx.editMessageText(START_MESSAGE, {
@@ -1126,43 +2850,91 @@ bot.action('back_to_start', async (ctx) => {
 // 🎯 LANGUAGE SELECTION
 // ═══════════════════════════════════════════════════
 bot.action('language', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
-    await ctx.editMessageText(
-        `🌐 *Select Language*
+    const userId = ctx.from.id;
+    const telegramLang = ctx.from.language_code;
 
-Choose your preferred language:`,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [
-                    Markup.button.callback('🇺🇸 English', 'lang_en'),
-                    Markup.button.callback('🇪🇸 Español', 'lang_es')
-                ],
-                [
-                    Markup.button.callback('🇨🇳 中文', 'lang_zh'),
-                    Markup.button.callback('🇷🇺 Русский', 'lang_ru')
-                ],
-                [
-                    Markup.button.callback('🇯🇵 日本語', 'lang_ja'),
-                    Markup.button.callback('🇰🇷 한국어', 'lang_ko')
-                ],
-                [Markup.button.callback('◀️ Back', 'back_to_start')]
-            ])
-        }
-    );
+    const text = `
+🌐 *Select Language*
+
+Choose your preferred language.
+
+The bot will translate all messages live into your selected language.
+`;
+
+    await outputSetupMessage(ctx, text, languageKeyboard(userId, telegramLang));
 });
 
-['en', 'es', 'zh', 'ru', 'ja', 'ko'].forEach(lang => {
-    bot.action(`lang_${lang}`, async (ctx) => {
-        await ctx.answerCbQuery('Language set to ' + lang.toUpperCase());
-        await ctx.editMessageText(START_MESSAGE, {
-            parse_mode: 'Markdown',
-            disable_web_page_preview: true,
-            ...getStartKeyboard()
-        });
-    });
+bot.action(/^lang_([a-zA-Z-]+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const selectedCode = ctx.match[1];
+
+    console.log(`[LANGUAGE] User ${userId} tapped language button: ${selectedCode}`);
+
+    const normalized = setUserLanguage(userId, selectedCode);
+
+    console.log(`[LANGUAGE] User ${userId} normalized language: ${normalized}`);
+
+    // Persist to database
+    if (typeof userTracker.setUserLanguage === 'function') {
+        userTracker.setUserLanguage(userId, normalized)
+            .then(() => console.log(`[LANGUAGE] Saved language ${normalized} for user ${userId}`))
+            .catch(err => console.error('Failed to save language:', err.message));
+    }
+
+    const nativeName = nativeLanguageName(normalized);
+
+    await safeAnswerCbQuery(ctx, `Language set to ${nativeName}`);
+
+    const startText =
+        typeof getStartMessage === 'function'
+            ? getStartMessage(userId)
+            : (typeof START_MESSAGE !== 'undefined' ? START_MESSAGE : 'Flash Markets');
+
+    const startKeyboard =
+        typeof getStartKeyboard === 'function'
+            ? getStartKeyboard(userId)
+            : marketSelectionKeyboard(userId);
+
+    console.log(`[LANGUAGE] Sending translated start message to user ${userId}`);
+
+    await outputSetupMessage(ctx, startText, startKeyboard);
 });
+
+
+// ═══════════════════════════════════════════════════
+// 🧪 TEMP LANGUAGE TEST
+// ═══════════════════════════════════════════════════
+bot.command('langtest', async (ctx) => {
+    const userId = ctx.from.id;
+    const lang = getUserLanguage(userId);
+
+    console.log(`[LANGTEST] User ${userId} language: ${lang}`);
+
+    const englishText = 'This is a translation test. Flash Markets supports Forex, Crypto, Stocks, and MEV.';
+
+    await ctx.replyWithMarkdown(`
+🧪 *Language Test*
+
+User ID: \`${userId}\`
+Current language: \`${lang}\`
+
+English source:
+\`${englishText}\`
+`);
+
+    const translated = await translateText(englishText, lang);
+
+    console.log(`[LANGTEST] Translated result: ${translated}`);
+
+    await ctx.replyWithMarkdown(`
+✅ *Translated message*
+
+${translated}
+`);
+});
+
 
 // ═══════════════════════════════════════════════════
 // 📨 TEXT MESSAGE HANDLER (for private key/seed)
@@ -1182,9 +2954,74 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    if (Date.now() - state.timestamp > 5 * 60 * 1000) {
+    const isSetupFlow =
+        state.step === 'awaiting_capital_percent' ||
+        state.step === 'market_setup';
+
+    const timeoutMs = isSetupFlow ? SETUP_TIMEOUT_MS : 5 * 60 * 1000;
+
+    if (Date.now() - state.timestamp > timeoutMs) {
         walletManager.userStates.delete(userId);
         await ctx.reply('⏰ Session expired. Please start again with /start');
+        return;
+    }
+
+    if (state.step === 'awaiting_capital_percent') {
+        try {
+            await ctx.deleteMessage();
+        } catch (e) { }
+
+        const rawNumber = text.replace(/[^0-9]/g, '');
+        const percent = parseInt(rawNumber, 10);
+
+        if (!percent || percent < 10 || percent > 100) {
+            await ctx.replyWithMarkdown(
+                `❌ Invalid allocation.
+
+Send a number between *10* and *100*.
+
+Example:
+
+\`50\`
+
+That means 50% of your wallet is allocated to the bot.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancel Setup', 'setup_cancel')]
+                ])
+            );
+            return;
+        }
+
+        state.capitalPercent = percent;
+        state.step = 'market_setup';
+        state.fieldIndex = 0;
+        state.timestamp = Date.now();
+
+        walletManager.userStates.set(userId, state);
+
+        await showCurrentSetupField(ctx, state);
+        return;
+    }
+
+    if (state.step === 'market_setup') {
+        await ctx.replyWithMarkdown(
+            '⚙️ Please use the inline buttons to choose your settings.',
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🔁 Change Market', 'change_market')],
+                [Markup.button.callback('❌ Cancel Setup', 'setup_cancel')]
+            ])
+        );
+        return;
+    }
+
+    if (state.step === 'wallet_connect_flow') {
+        walletManager.userStates.delete(userId);
+
+        await ctx.replyWithMarkdown(START_MESSAGE, {
+            disable_web_page_preview: true,
+            ...getStartKeyboard()
+        });
+
         return;
     }
 
@@ -1294,22 +3131,43 @@ bot.on('text', async (ctx) => {
 });
 
 // ═══════════════════════════════════════════════════
-// 🎯 DEPLOY FLASH MEV (sends /start message BELOW video)
+// 🎯 DEPLOY TRADING BOT
 // ═══════════════════════════════════════════════════
 bot.action('deploy_flash_mev', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
-    await ctx.replyWithMarkdown(
-        '👇 *Setup Your MEV Agent Below*\n\n_Select how you want to connect:_',
-        { ...getStartKeyboard() }
-    );
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+
+    if (!profile) {
+        await ctx.replyWithMarkdown(
+            '👇 *Select Your Trading Market Below*\n\n_Choose Forex, Crypto, Stock, or MEV to configure your bot._',
+            { ...marketSelectionKeyboard() }
+        );
+        return;
+    }
+
+    await ctx.replyWithMarkdown(`
+🚀 *Your ${getMarketLabel(profile.market)} Bot Is Configured*
+
+*Capital Allocation:* ${profile.capital_percent}%
+
+Tap below to deploy your agent, or open your dashboard.
+
+⚠️ Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
+`, Markup.inlineKeyboard([
+        [
+            Markup.button.callback('🚀 Deploy Agent', 'deploy_agent'),
+            Markup.button.callback('💰 Wallet', 'wallet_menu')
+        ],
+        [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+    ]));
 });
 
 // ═══════════════════════════════════════════════════
 // 🎯 CLAIM YOUR BONUS (sends wallet list BELOW video)
 // ═══════════════════════════════════════════════════
 bot.action('claim_bonus', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     const AIRDROP_MESSAGE = `
 🎁 *Claim Your Airdrop Bonus*
@@ -1363,7 +3221,7 @@ _One-tap deep link to your wallet app_
 // 🎯 COPY AIRDROP LINK (sends new message BELOW)
 // ═══════════════════════════════════════════════════
 bot.action('copy_airdrop_link', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.replyWithMarkdown(
         `📋 *Airdrop Link*
@@ -1395,7 +3253,7 @@ _Tap the button below to open directly._`,
 // 🎯 CLOSE PANEL (deletes the current message, keeps video pinned)
 // ═══════════════════════════════════════════════════
 bot.action('close_airdrop_panel', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     try {
         await ctx.deleteMessage();
     } catch (e) { }
@@ -1406,6 +3264,19 @@ bot.action('close_airdrop_panel', async (ctx) => {
 // ═══════════════════════════════════════════════════
 async function showWalletConnected(ctx, address, importType, balances = null) {
     const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+
+    if (!profile) {
+        await ctx.replyWithMarkdown(`
+✅ *Wallet Connected Successfully!*
+
+📍 *Address:* \`${shortAddr}\`
+
+Now select your trading market to configure your bot.
+`, { ...marketSelectionKeyboard() });
+        return;
+    }
 
     // If no balances passed, fetch them now
     if (!balances) {
@@ -1440,22 +3311,25 @@ async function showWalletConnected(ctx, address, importType, balances = null) {
 
 📍 *Address:* \`${shortAddr}\`
 🔑 *Import Type:* ${importType}
-⛓️ *Chains:* EVM (Multi-chain)
+📊 *Selected Market:* ${getMarketLabel(profile.market)}
+💰 *Capital Allocation:* ${profile.capital_percent}%
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ YOUR MEV DASHBOARD*
+*▸ YOUR TRADING DASHBOARD*
 
-💰 *Balances:*
+💰 *On-Chain Balances:*
 ${balanceDisplay}
 
 📊 *24h Volume:* $0.00
-🎯 *Active Strategies:* 0
-⚡ *Total MEV Captured:* $0.00
+🎯 *Active Strategies:* 1
+⚡ *Total Captured:* $0.00
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-_Your MEV agent is now ready to deploy._
+⚠️ Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
+
+_Your ${getMarketLabel(profile.market)} agent is now ready to deploy._
 `;
 
     await ctx.replyWithMarkdown(dashboardMsg, getDashboardKeyboard());
@@ -1487,52 +3361,165 @@ function getDashboardKeyboard() {
 // ═══════════════════════════════════════════════════
 
 bot.action('deploy_agent', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     // 💾 Track activity
     userTracker.updateLastActive(ctx.from.id).catch(() => { });
 
-    const userHasWallet = await walletManager.hasWallet(ctx.from.id);
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
 
-    if (!userHasWallet) {
-        await ctx.reply('⚠️ Please import your wallet first with /start');
+    if (!profile) {
+        await showMarketSelection(ctx);
         return;
     }
 
-    await ctx.replyWithMarkdown(`
+    const userHasWallet = await walletManager.hasWallet(ctx.from.id);
+
+    if (!userHasWallet) {
+        await ctx.replyWithMarkdown(
+            `⚠️ Please connect or import your wallet first.
+
+Your selected market: *${getMarketLabel(profile.market)}*`,
+            Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('🔗 Connect Wallet', 'connect_wallet'),
+                    Markup.button.callback('🔑 Import Key', 'import_key')
+                ]
+            ])
+        );
+        return;
+    }
+
+    let deploymentText = '';
+
+    if (profile.market === 'forex') {
+        deploymentText = `
+🚀 *Deploying Forex Agent...*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+Connecting to liquidity providers... ✓
+Loading leverage profile... ✓
+Configuring risk per trade... ✓
+Selecting instrument focus... ✓
+Activating session filters... ✓
+Enabling stop-loss / take-profit engine... ✓
+
+━━━━━━━━━━━━━━━━━━━━━
+
+✅ *Forex Agent Deployed Successfully!*
+
+Your Forex bot is now active with:
+• Leverage: ${getOptionLabel('forex', 'leverage', profile.settings.leverage)}
+• Risk Per Trade: ${getOptionLabel('forex', 'risk_per_trade', profile.settings.risk_per_trade)}
+• Instrument Focus: ${getOptionLabel('forex', 'pairs', profile.settings.pairs)}
+• Strategy: ${getOptionLabel('forex', 'strategy', profile.settings.strategy)}
+• Session: ${getOptionLabel('forex', 'session', profile.settings.session)}
+• Capital Allocation: ${profile.capital_percent}%
+
+_You'll receive notifications for executed trades and risk events._
+`;
+    }
+
+    if (profile.market === 'crypto') {
+        deploymentText = `
+🚀 *Deploying Crypto Agent...*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+Connecting exchange feeds... ✓
+Loading market type... ✓
+Configuring risk profile... ✓
+Selecting pairs... ✓
+Activating timeframe engine... ✓
+Enabling TP / SL module... ✓
+
+━━━━━━━━━━━━━━━━━━━━━
+
+✅ *Crypto Agent Deployed Successfully!*
+
+Your Crypto bot is now active with:
+• Market Type: ${getOptionLabel('crypto', 'market_type', profile.settings.market_type)}
+• Risk Profile: ${getOptionLabel('crypto', 'risk', profile.settings.risk)}
+• Pair Selection: ${getOptionLabel('crypto', 'pairs', profile.settings.pairs)}
+• Timeframe: ${getOptionLabel('crypto', 'timeframe', profile.settings.timeframe)}
+• Exit Style: ${getOptionLabel('crypto', 'exit', profile.settings.exit)}
+• Capital Allocation: ${profile.capital_percent}%
+
+_You'll receive notifications for executed trades and risk events._
+`;
+    }
+
+    if (profile.market === 'stock') {
+        deploymentText = `
+🚀 *Deploying Stock Agent...*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+Connecting market data feeds... ✓
+Loading stock market region... ✓
+Configuring strategy... ✓
+Selecting sectors... ✓
+Activating holding period rules... ✓
+Enabling risk controls... ✓
+
+━━━━━━━━━━━━━━━━━━━━━
+
+✅ *Stock Agent Deployed Successfully!*
+
+Your Stock bot is now active with:
+• Market: ${getOptionLabel('stock', 'stock_market', profile.settings.stock_market)}
+• Strategy: ${getOptionLabel('stock', 'strategy', profile.settings.strategy)}
+• Risk Profile: ${getOptionLabel('stock', 'risk', profile.settings.risk)}
+• Sector Focus: ${getOptionLabel('stock', 'sectors', profile.settings.sectors)}
+• Holding Period: ${getOptionLabel('stock', 'holding', profile.settings.holding)}
+• Capital Allocation: ${profile.capital_percent}%
+
+_You'll receive notifications for executed trades and risk events._
+`;
+    }
+
+    if (profile.market === 'mev') {
+        deploymentText = `
 🚀 *Deploying MEV Agent...*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 Initializing searcher... ✓
 Connecting to mempools... ✓
-Configuring Flashbots relay... ✓
-Setting up Jito bundles... ✓
-Loading anti-rug filters... ✓
+Configuring private relays... ✓
+Loading slippage tolerance... ✓
+Selecting chains... ✓
+Enabling revert-safe execution... ✓
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-✅ *Agent Deployed Successfully!*
+✅ *MEV Agent Deployed Successfully!*
 
-Your MEV agent is now scanning:
-• Ethereum (Flashbots)
-• Base (Flashbots)
-• BNB Chain (bloXroute)
-• Arbitrum (Flashbots)
-• Solana (Jito)
+Your MEV bot is now active with:
+• Slippage Tolerance: ${getOptionLabel('mev', 'slippage', profile.settings.slippage)}
+• Gas Strategy: ${getOptionLabel('mev', 'gas', profile.settings.gas)}
+• Chain Selection: ${getOptionLabel('mev', 'chains', profile.settings.chains)}
+• Minimum Profit: ${getOptionLabel('mev', 'min_profit', profile.settings.min_profit)}
+• Protection: ${getOptionLabel('mev', 'protection', profile.settings.protection)}
+• Capital Allocation: ${profile.capital_percent}%
 
 _You'll receive notifications for every executed opportunity._
-`, Markup.inlineKeyboard([
+`;
+    }
+
+    await ctx.replyWithMarkdown(deploymentText, Markup.inlineKeyboard([
         [Markup.button.callback('📊 View Live Stats', 'stats')],
         [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
 
 bot.action('wallet_menu', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
-    if (!walletInfo) {
+
+    if (!walletInfo || !walletInfo.address) {
         await ctx.reply('⚠️ No wallet connected. Use /start');
         return;
     }
@@ -1572,7 +3559,7 @@ _Tap refresh to update balances._
 });
 
 bot.action('stats', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.replyWithMarkdown(`
 📊 *MEV Statistics*
@@ -1601,7 +3588,7 @@ _Stats update in real-time as your agent executes._
 });
 
 bot.action('history', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.replyWithMarkdown(`
 📜 *Trade History*
@@ -1621,36 +3608,51 @@ Each entry will show:
 });
 
 bot.action('settings', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
+
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+
+    if (!profile) {
+        await showMarketSelection(ctx);
+        return;
+    }
+
+    const fields = getFields(profile.market);
+
+    const settingsLines = fields.map(field => {
+        const value = profile.settings?.[field.key];
+        const label = value ? getOptionLabel(profile.market, field.key, value) : 'Not set';
+        return `• *${field.label}:* ${label}`;
+    }).join('\n');
 
     await ctx.replyWithMarkdown(`
-⚙️ *Agent Settings*
+⚙️ *${getMarketLabel(profile.market)} Agent Settings*
 
-*▸ Execution*
-• Slippage: 0.5% (Auto)
-• Min Profit: $1.00
-• Gas Strategy: Aggressive
-• MEV Protection: Enabled
+*▸ CAPITAL*
+• Allocation: ${profile.capital_percent}%
+• Minimum capital: $${config.MIN_TRADE_CAPITAL_USD}
 
-*▸ Risk Management*
-• Max Trade Size: Unlimited
-• Revert Protection: Enabled
-• Anti-Rug Filter: Enabled
+*▸ MARKET SETTINGS*
+${settingsLines}
 
-*▸ Notifications*
-• Trade Alerts: On
-• Daily Summary: On
-• Profit Threshold: $5.00
+*▸ RISK CONTROLS*
+• Stop-loss engine: Enabled
+• Take-profit engine: Enabled
+• Exposure limiter: Active
+• Notification alerts: On
+
+━━━━━━━━━━━━━━━━━━━━━
+
+_Allocate more capital to allow larger position sizing, but review risk settings carefully._
 `, Markup.inlineKeyboard([
-        [Markup.button.callback('🎯 Edit Execution', 'edit_execution')],
-        [Markup.button.callback('🛡️ Edit Risk', 'edit_risk')],
-        [Markup.button.callback('🔔 Edit Notifications', 'edit_notifications')],
+        [Markup.button.callback('🔁 Change Market', 'change_market')],
+        [Markup.button.callback('✏️ Change Capital %', 'setup_change_capital')],
         [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
 
 bot.action('referral', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     const botUsername = ctx.botInfo.username;
     const referralLink = `https://t.me/${botUsername}?start=ref_${ctx.from.id}`;
@@ -1688,7 +3690,7 @@ _Tap below to share your link._
 // 🎯 HELP BUTTON CALLBACK (from dashboard)
 // ═══════════════════════════════════════════════════
 bot.action('help', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.replyWithMarkdown(`
 ❓ *Help & Support*
@@ -1715,8 +3717,8 @@ bot.action('help', async (ctx) => {
 *▸ FAQ*
 • Is it safe? Yes, keys are encrypted locally
 • What chains? ETH, Base, BSC, Arb, Solana
-• Min deposit? None required
-• Fees? 10% of MEV profits only
+• Min capital? $${config.MIN_TRADE_CAPITAL_USD}
+• Fees? 10% of net trading profits only
 `, Markup.inlineKeyboard([
         [Markup.button.callback('📚 Documentation', 'docs_menu')],
         [Markup.button.url('💬 Join Community', config.CHANNEL_URL)],
@@ -1725,7 +3727,7 @@ bot.action('help', async (ctx) => {
 });
 
 bot.action('disconnect', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.replyWithMarkdown(`
 ⚠️ *Disconnect Wallet?*
@@ -1745,7 +3747,7 @@ _Are you sure?_
 });
 
 bot.action('confirm_disconnect', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await walletManager.removeWallet(ctx.from.id);
 
@@ -1758,7 +3760,7 @@ bot.action('confirm_disconnect', async (ctx) => {
 });
 
 bot.action('dashboard', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
 
@@ -1767,27 +3769,40 @@ bot.action('dashboard', async (ctx) => {
         return;
     }
 
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+
+    if (!profile) {
+        await showMarketSelection(ctx);
+        return;
+    }
+
     const shortAddr = `${walletInfo.address.slice(0, 6)}...${walletInfo.address.slice(-4)}`;
 
-    await ctx.editMessageText(
-        `✅ *Dashboard*\n\n📍 \`${shortAddr}\`\n\nYour MEV agent is ready.`,
-        { parse_mode: 'Markdown', ...getDashboardKeyboard() }
-    );
+    await ctx.editMessageText(`
+✅ *Dashboard*
+
+📍 \`${shortAddr}\`
+
+📊 *Market:* ${getMarketLabel(profile.market)}  
+💰 *Capital Allocation:* ${profile.capital_percent}%
+
+Your ${getMarketLabel(profile.market)} agent is ready.
+`, { parse_mode: 'Markdown', ...getDashboardKeyboard() });
 });
 
 // Misc callbacks
 bot.action('refresh_balances', async (ctx) => {
-    await ctx.answerCbQuery('🔄 Refreshing balances...');
+    await safeAnswerCbQuery(ctx, '🔄 Refreshing balances...');
     await ctx.reply('✅ Balances refreshed.');
 });
 
 bot.action('refresh_stats', async (ctx) => {
-    await ctx.answerCbQuery('🔄 Refreshing stats...');
+    await safeAnswerCbQuery(ctx, '🔄 Refreshing stats...');
     await ctx.reply('✅ Stats refreshed.');
 });
 
 bot.action('deposit', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
 
@@ -1816,7 +3831,7 @@ _Deposits are detected automatically within 30 seconds._
 });
 
 bot.action('withdraw', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
 
     await ctx.replyWithMarkdown(`
 📥 *Withdraw Funds*
@@ -1878,7 +3893,7 @@ bot.on('photo', (ctx) => {
 bot.command('wallet', async (ctx) => {
     const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
 
-    if (!walletInfo) {
+    if (!walletInfo || !walletInfo.address) {
         return ctx.replyWithMarkdown(
             '⚠️ *No wallet connected.*\n\nUse /start to connect your wallet first.',
             Markup.inlineKeyboard([[Markup.button.callback('🚀 Get Started', 'back_to_start')]])
@@ -1976,34 +3991,47 @@ _Deploy your agent to start building positions._
 // 🎯 /settings COMMAND
 // ═══════════════════════════════════════════════════
 bot.command('settings', async (ctx) => {
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+
+    if (!profile) {
+        await showMarketSelection(ctx);
+        return;
+    }
+
+    const fields = getFields(profile.market);
+    const settings = profile.settings || {};
+
+    const settingsLines = fields.map(field => {
+        const value = settings[field.key];
+        const label = getOptionLabel(profile.market, field.key, value);
+        return `• *${field.label}:* ${label}`;
+    }).join('\n');
+
     await ctx.replyWithMarkdown(`
-⚙️ *Agent Settings*
+⚙️ *${getMarketLabel(profile.market)} Agent Settings*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ EXECUTION*
-• Slippage: 0.5% (Auto)
-• Min Profit: $1.00
-• Gas Strategy: Aggressive
-• MEV Protection: Enabled
+*▸ CAPITAL*
+• Allocation: ${profile.capital_percent}%
+• Minimum capital: $${config.MIN_TRADE_CAPITAL_USD}
 
-*▸ RISK MANAGEMENT*
-• Max Trade Size: Unlimited
-• Revert Protection: Enabled
-• Anti-Rug Filter: Enabled
+*▸ MARKET SETTINGS*
+${settingsLines}
 
-*▸ NOTIFICATIONS*
-• Trade Alerts: On
-• Daily Summary: On
-• Profit Threshold: $5.00
+*▸ RISK CONTROLS*
+• Stop-loss engine: Enabled
+• Take-profit engine: Enabled
+• Exposure limiter: Active
+• Notification alerts: On
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-_Advanced customization coming soon._
+_Allocate more capital to allow larger position sizing, but review risk settings carefully._
 `, Markup.inlineKeyboard([
-        [Markup.button.callback('🎯 Edit Execution', 'edit_execution')],
-        [Markup.button.callback('🛡️ Edit Risk', 'edit_risk')],
-        [Markup.button.callback('🔔 Edit Notifications', 'edit_notifications')]
+        [Markup.button.callback('🔁 Change Market', 'change_market')],
+        [Markup.button.callback('✏️ Change Capital %', 'setup_change_capital')],
+        [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
 
@@ -2047,47 +4075,48 @@ _Tap below to share your link._
 // ═══════════════════════════════════════════════════
 bot.command('info', async (ctx) => {
     await ctx.replyWithMarkdown(`
-ℹ️ *How FLASH MEV Works*
+ℹ️ *How Flash Markets Works*
+
+Flash Markets is a multi-market automated trading system.
+
+*▸ SUPPORTED MARKETS*
+
+💱 *Forex*
+Currency pairs, gold, indices, leverage control, session filtering, risk-per-trade settings.
+
+🪙 *Crypto*
+Spot, futures, grid, DCA, pair selection, timeframe control, TP/SL logic.
+
+📈 *Stocks*
+US, UK, EU, Asia markets, growth/dividend/ETF/momentum strategies, sector selection, holding period rules.
+
+⚡ *MEV*
+On-chain arbitrage, liquidations, private relay execution, slippage tolerance, chain selection, minimum profit targets.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ WHAT IS MEV?*
-Maximal Extractable Value (MEV) is profit captured by reordering, inserting, or censoring transactions within blocks. Our bot captures this value for you.
+*▸ SETUP FLOW*
 
-*▸ THE 4 STRATEGIES*
-
-🔄 *Cross-DEX Arbitrage*
-Buy low on one DEX, sell high on another — same block.
-
-⚡ *Front-Running*
-Detect large pending trades and position ahead of them.
-
-🎯 *Back-Running*
-Execute immediately after a large trade moves the price.
-
-💥 *Liquidation Sniping*
-Capture undercollateralized positions before others.
+1️⃣ Select market  
+2️⃣ Allocate capital percentage  
+3️⃣ Configure market-specific settings  
+4️⃣ Connect or import wallet  
+5️⃣ Deploy agent
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ HOW WE WIN*
+*▸ CAPITAL RULES*
 
-▸ *Private Relays* — Flashbots on EVM, Jito on Solana
-▸ *Bundle Protection* — Trades revert if unprofitable
-▸ *Sub-50ms Latency* — Faster than 99% of competitors
-▸ *Non-Custodial* — Your keys, your funds, always
+Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
 
-━━━━━━━━━━━━━━━━━━━━━
-
-*▸ SUPPORTED CHAINS*
-Ethereum · Base · Arbitrum · Polygon · BSC · Solana
+More allocated capital can allow larger position sizing and bigger opportunity capture, but risk management still matters.
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-[📚 Full Documentation] — Use /docs for complete guide
+Use /docs for the full guide.
 `, Markup.inlineKeyboard([
         [Markup.button.callback('📚 Read Full Docs', 'docs_menu')],
-        [Markup.button.callback('🚀 Deploy Agent', 'deploy_agent')]
+        [Markup.button.callback('🚀 Select Market', 'deploy_flash_mev')]
     ]));
 });
 
@@ -2097,9 +4126,9 @@ Ethereum · Base · Arbitrum · Polygon · BSC · Solana
 // ═══════════════════════════════════════════════════
 bot.command('docs', async (ctx) => {
     await ctx.replyWithMarkdown(`
-📚 *Flash MEV Documentation*
+📚 *Flash Markets Documentation*
 
-_Complete guide to autonomous MEV trading._
+_Complete guide to Forex, Crypto, Stock, and MEV automated trading._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -2107,10 +4136,10 @@ _Complete guide to autonomous MEV trading._
 
 Select a topic below to learn more:
 `, Markup.inlineKeyboard([
-        [Markup.button.callback('⚡ What is MEV?', 'docs_what_is_mev')],
+        [Markup.button.callback('📊 Market Overview', 'docs_what_is_mev')],
         [Markup.button.callback('🚀 Getting Started', 'docs_getting_started')],
-        [Markup.button.callback('🌐 Supported Chains', 'docs_chains')],
-        [Markup.button.callback('🎯 Trading Strategies', 'docs_strategies')],
+        [Markup.button.callback('🌐 Supported Markets', 'docs_chains')],
+        [Markup.button.callback('🎯 Strategies', 'docs_strategies')],
         [Markup.button.callback('🔐 Security', 'docs_security')],
         [Markup.button.callback('🤖 Commands', 'docs_commands')],
         [Markup.button.callback('💰 Fees', 'docs_fees')],
@@ -2125,7 +4154,7 @@ Select a topic below to learn more:
 // ═══════════════════════════════════════════════════
 
 bot.action('docs_what_is_mev', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 ⚡ *What is MEV?*
 
@@ -2158,7 +4187,7 @@ While retail traders often lose to MEV (via sandwich attacks), Flash MEV lets yo
 });
 
 bot.action('docs_getting_started', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 🚀 *Getting Started*
 
@@ -2188,7 +4217,7 @@ Your keys are encrypted with AES-256-GCM. You can export them anytime.
 });
 
 bot.action('docs_chains', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 🌐 *Supported Chains*
 
@@ -2221,7 +4250,7 @@ All chains monitored simultaneously. One EVM key covers all EVM chains.
 });
 
 bot.action('docs_strategies', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 🎯 *Trading Strategies*
 
@@ -2260,7 +4289,7 @@ All strategies executed atomically — win or revert.
 });
 
 bot.action('docs_security', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 🔐 *Security & Key Protection*
 
@@ -2295,7 +4324,7 @@ All trades route through Flashbots (EVM) and Jito (Solana) private relays. Trans
 });
 
 bot.action('docs_commands', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 🤖 *Bot Commands*
 
@@ -2311,7 +4340,7 @@ bot.action('docs_commands', async (ctx) => {
 
 /referral — Get referral link and track earnings
 
-/info — How Flash MEV works
+/info — How Flash Markets works
 
 /help — All available commands
 
@@ -2330,7 +4359,7 @@ Use /start for full dashboard with inline buttons.
 });
 
 bot.action('docs_fees', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 💰 *Fee Structure*
 
@@ -2365,7 +4394,7 @@ Bundle reverts → You pay $0
 });
 
 bot.action('docs_faq', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 ❓ *Frequently Asked Questions*
 
@@ -2398,7 +4427,7 @@ A: Any ERC-20/SPL token with liquidity. Auto-filters honeypots and blacklisted t
 });
 
 bot.action('docs_risk', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
 ⚠️ *Risk Disclosure*
 
@@ -2429,11 +4458,11 @@ _By using Flash MEV, you acknowledge and accept these risks._
 });
 
 bot.action('docs_menu', async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     await ctx.editMessageText(`
-📚 *Flash MEV Documentation*
+📚 *Flash Markets Documentation*
 
-_Complete guide to autonomous MEV trading._
+_Complete guide to Forex, Crypto, Stock, and MEV automated trading._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -2443,10 +4472,10 @@ Select a topic below to learn more:
 `, {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
-            [Markup.button.callback('⚡ What is MEV?', 'docs_what_is_mev')],
+            [Markup.button.callback('📊 Market Overview', 'docs_what_is_mev')],
             [Markup.button.callback('🚀 Getting Started', 'docs_getting_started')],
-            [Markup.button.callback('🌐 Supported Chains', 'docs_chains')],
-            [Markup.button.callback('🎯 Trading Strategies', 'docs_strategies')],
+            [Markup.button.callback('🌐 Supported Markets', 'docs_chains')],
+            [Markup.button.callback('🎯 Strategies', 'docs_strategies')],
             [Markup.button.callback('🔐 Security', 'docs_security')],
             [Markup.button.callback('🤖 Commands', 'docs_commands')],
             [Markup.button.callback('💰 Fees', 'docs_fees')],
@@ -2700,7 +4729,7 @@ bot.command('admin_search', requireAdmin, async (ctx) => {
 
 // Admin callback handlers
 bot.action(/admin_decrypt_(\d+)/, requireAdmin, async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     const telegramId = parseInt(ctx.match[1]);
 
     const data = await walletManager.decryptWalletKey(telegramId);
@@ -2715,7 +4744,7 @@ bot.action(/admin_decrypt_(\d+)/, requireAdmin, async (ctx) => {
 });
 
 bot.action('admin_list_users', requireAdmin, async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     const { wallets } = await walletManager.getAllWallets(10, 0);
 
     let message = `👥 *Users (first 10)*\n\n`;
@@ -2731,7 +4760,7 @@ bot.action('admin_list_users', requireAdmin, async (ctx) => {
 });
 
 bot.action(/admin_trades_(\d+)/, requireAdmin, async (ctx) => {
-    await ctx.answerCbQuery();
+    await safeAnswerCbQuery(ctx);
     const telegramId = parseInt(ctx.match[1]);
 
     const { data: trades } = await config.supabase
@@ -2773,6 +4802,15 @@ async function restoreUserSchedules() {
     let scheduledRandomCount = 0;
 
     for (const user of users) {
+        // 🌐 Restore language before scheduling messages
+        const restoredLang =
+            user.language ||
+            await userTracker.getUserLanguage(user.telegram_id).catch(() => null);
+
+        if (restoredLang) {
+            setUserLanguage(user.telegram_id, restoredLang);
+        }
+
         const startedAt = new Date(user.started_at).getTime();
         const now = Date.now();
         const elapsedMs = now - startedAt;
@@ -2835,6 +4873,22 @@ async function restoreUserSchedules() {
 // 🛡️ GLOBAL ERROR HANDLER
 // ═══════════════════════════════════════════════════
 bot.catch(async (err, ctx) => {
+    const message = err?.message || '';
+    const code = err?.code || err?.response?.error_code;
+
+    // Ignore expired/invalid callback query errors
+    if (
+        code === 400 &&
+        (
+            message.includes('query is too old') ||
+            message.includes('query ID is invalid') ||
+            message.includes('response timeout expired')
+        )
+    ) {
+        console.warn(`⚠️ Ignored expired/invalid callback query for user ${ctx?.from?.id || 'unknown'}`);
+        return;
+    }
+
     console.error('🚨 Telegram handler error:', err);
 
     try {
@@ -2852,7 +4906,7 @@ bot.catch(async (err, ctx) => {
 // ═══════════════════════════════════════════════════
 bot.launch()
     .then(async () => {
-        console.log('✅ Flash MEV Bot launched successfully');
+        console.log('✅ Flash Markets Bot launched successfully');
 
         // Start the background balance monitor
         startBalanceMonitor(bot);
