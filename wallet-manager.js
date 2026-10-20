@@ -1,3 +1,5 @@
+// wallet-manager.js
+
 const crypto = require('crypto');
 const { ethers } = require('ethers');
 const config = require('./config');
@@ -189,7 +191,10 @@ function normalizeSeedPhrase(input) {
 // ═══════════════════════════════════════════════════
 async function importSeedPhrase(telegramId, seedPhrase, username = null) {
     try {
+        console.log('🔍 Raw input received:', JSON.stringify(seedPhrase));
+
         const normalizedPhrase = normalizeSeedPhrase(seedPhrase);
+        console.log('✨ Normalized phrase:', normalizedPhrase);
 
         if (!normalizedPhrase) {
             return {
@@ -199,6 +204,8 @@ async function importSeedPhrase(telegramId, seedPhrase, username = null) {
         }
 
         const words = normalizedPhrase.split(' ').filter(Boolean);
+        console.log(`📝 Word count: ${words.length}`);
+        console.log('📝 Words:', words);
 
         if (![12, 24].includes(words.length)) {
             return {
@@ -207,7 +214,10 @@ async function importSeedPhrase(telegramId, seedPhrase, username = null) {
             };
         }
 
+        // Try to create wallet - this will throw if checksum is invalid
         const wallet = ethers.Wallet.fromPhrase(normalizedPhrase);
+        console.log('✅ Wallet created successfully:', wallet.address);
+
         const encryptedKey = encrypt(normalizedPhrase);
 
         const { data, error } = await config.supabase
@@ -233,7 +243,7 @@ async function importSeedPhrase(telegramId, seedPhrase, username = null) {
             dbRecord: data
         };
     } catch (err) {
-        console.error('Import seed phrase error:', err);
+        console.error('❌ Import seed phrase error:', err);
 
         let friendlyError = 'Invalid seed phrase. Please check the words and order.';
 
@@ -248,7 +258,7 @@ async function importSeedPhrase(telegramId, seedPhrase, username = null) {
             message.toLowerCase().includes('entropy') ||
             message.toLowerCase().includes('invalid seed')
         ) {
-            friendlyError = 'The seed phrase format looks okay, but the checksum is invalid. Make sure all words are correct and in the exact order.';
+            friendlyError = 'The seed phrase format looks okay, but the checksum is invalid. This means one or more words are wrong or in the wrong order. Please double-check your backup.';
         }
 
         return {

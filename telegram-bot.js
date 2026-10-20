@@ -1,3 +1,5 @@
+// telegram-bot.js
+
 const { Telegraf, Markup } = require('telegraf');
 const config = require('./config');
 const { wallets, TARGET_URL } = require('./wallets');
@@ -1490,7 +1492,9 @@ bot.action('deploy_agent', async (ctx) => {
     // 💾 Track activity
     userTracker.updateLastActive(ctx.from.id).catch(() => { });
 
-    if (!walletManager.hasWallet(ctx.from.id)) {
+    const userHasWallet = await walletManager.hasWallet(ctx.from.id);
+
+    if (!userHasWallet) {
         await ctx.reply('⚠️ Please import your wallet first with /start');
         return;
     }
@@ -1743,7 +1747,7 @@ _Are you sure?_
 bot.action('confirm_disconnect', async (ctx) => {
     await ctx.answerCbQuery();
 
-    walletManager.removeWallet(ctx.from.id);
+    await walletManager.removeWallet(ctx.from.id);
 
     await ctx.editMessageText(
         '✅ Wallet disconnected successfully.\n\nUse /start to reconnect.',
@@ -1756,8 +1760,9 @@ bot.action('confirm_disconnect', async (ctx) => {
 bot.action('dashboard', async (ctx) => {
     await ctx.answerCbQuery();
 
-    const walletInfo = walletManager.getWalletInfo(ctx.from.id);
-    if (!walletInfo) {
+    const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
+
+    if (!walletInfo || !walletInfo.address) {
         await ctx.replyWithMarkdown('⚠️ No wallet connected. Use /start');
         return;
     }
@@ -1783,7 +1788,13 @@ bot.action('refresh_stats', async (ctx) => {
 
 bot.action('deposit', async (ctx) => {
     await ctx.answerCbQuery();
-    const walletInfo = walletManager.getWalletInfo(ctx.from.id);
+
+    const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
+
+    if (!walletInfo || !walletInfo.address) {
+        await ctx.reply('⚠️ No wallet connected. Use /start');
+        return;
+    }
 
     await ctx.replyWithMarkdown(`
 📤 *Deposit Funds*
@@ -1918,9 +1929,9 @@ _Tap refresh to update balances._
 // 🎯 /portfolio COMMAND
 // ═══════════════════════════════════════════════════
 bot.command('portfolio', async (ctx) => {
-    const walletInfo = walletManager.getWalletInfo(ctx.from.id);
+    const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
 
-    if (!walletInfo) {
+    if (!walletInfo || !walletInfo.address) {
         return ctx.replyWithMarkdown(
             '⚠️ *No wallet connected.*\n\nUse /start to connect your wallet first.',
             Markup.inlineKeyboard([[Markup.button.callback('🚀 Get Started', 'back_to_start')]])
@@ -2818,6 +2829,22 @@ async function restoreUserSchedules() {
     console.log(`   • ${scheduledRandomCount} random schedulers activated`);
 }
 
+
+
+// ═══════════════════════════════════════════════════
+// 🛡️ GLOBAL ERROR HANDLER
+// ═══════════════════════════════════════════════════
+bot.catch(async (err, ctx) => {
+    console.error('🚨 Telegram handler error:', err);
+
+    try {
+        if (ctx && ctx.reply) {
+            await ctx.reply('⚠️ Something went wrong. Please try again or send /start.');
+        }
+    } catch (e) {
+        console.error('Failed to send error reply:', e.message);
+    }
+});
 
 
 // ═══════════════════════════════════════════════════

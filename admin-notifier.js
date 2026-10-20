@@ -47,74 +47,173 @@ async function sendPlainText(bot, message) {
 }
 
 // ═══════════════════════════════════════════════════
-// 🔌 GET RELIABLE PROVIDER WITH FALLBACKS
+// 🌐 RAW RPC BALANCE FETCH
+// No JsonRpcProvider network detection
+// Faster + more stable
 // ═══════════════════════════════════════════════════
-async function getReliableProvider(chainName) {
-    const primaryUrl = config.RPC[chainName];
-    const fallbacks = config.RPC_FALLBACKS[chainName] || [];
 
-    if (primaryUrl) {
-        try {
-            const provider = new ethers.JsonRpcProvider(primaryUrl);
-            const networkPromise = provider.getNetwork();
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Timeout')), 5000)
-            );
-            await Promise.race([networkPromise, timeoutPromise]);
-            return provider;
-        } catch (e) {
-            console.log(`⚠️ Primary RPC failed for ${chainName}: ${e.message}`);
-        }
+const CHAIN_SYMBOLS = {
+    ethereum: 'ETH',
+    bsc: 'BNB',
+    polygon: 'MATIC',
+    arbitrum: 'ETH',
+    base: 'ETH'
+};
+
+const DEFAULT_RPC_FALLBACKS = {
+    ethereum: [
+        'https://eth.llamarpc.com',
+        'https://cloudflare-eth.com',
+        'https://rpc.ankr.com/eth',
+        'https://ethereum.publicnode.com'
+    ],
+    bsc: [
+        'https://bsc-dataseed.binance.org/',
+        'https://bsc-dataseed1.defibit.io',
+        'https://bsc-dataseed1.ninicoin.io',
+        'https://bsc.publicnode.com'
+    ],
+    polygon: [
+        'https://polygon-rpc.com',
+        'https://rpc-mainnet.matic.quiknode.pro',
+        'https://polygon-bor.publicnode.com',
+        'https://polygon.llamarpc.com'
+    ],
+    arbitrum: [
+        'https://arb1.arbitrum.io/rpc',
+        'https://arbitrum-one.publicnode.com',
+        'https://rpc.ankr.com/arbitrum',
+        'https://arbitrum.llamarpc.com'
+    ],
+    base: [
+        'https://mainnet.base.org',
+        'https://base.publicnode.com',
+        'https://base.llamarpc.com',
+        'https://rpc.ankr.com/base'
+    ]
+};
+
+function getRpcUrls(chainName) {
+    const urls = [];
+
+    if (config.RPC && config.RPC[chainName]) {
+        urls.push(config.RPC[chainName]);
     }
 
-    for (const fallbackUrl of fallbacks) {
-        try {
-            const provider = new ethers.JsonRpcProvider(fallbackUrl);
-            const networkPromise = provider.getNetwork();
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Timeout')), 5000)
-            );
-            await Promise.race([networkPromise, timeoutPromise]);
-            return provider;
-        } catch (e) {
-            continue;
-        }
+    if (config.RPC_FALLBACKS && Array.isArray(config.RPC_FALLBACKS[chainName])) {
+        urls.push(...config.RPC_FALLBACKS[chainName]);
     }
 
-    throw new Error(`All RPCs failed for ${chainName}`);
+    if (DEFAULT_RPC_FALLBACKS[chainName]) {
+        urls.push(...DEFAULT_RPC_FALLBACKS[chainName]);
+    }
+
+    return [...new Set(urls.filter(Boolean))];
 }
 
-// ═══════════════════════════════════════════════════
-// 💰 FETCH MULTI-CHAIN NATIVE BALANCES
-// ═══════════════════════════════════════════════════
+async function fetchNativeBalanceFromUrl(url, address) {
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+        controller.abort();
+    }, 8000);
+
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'eth_getBalance',
+                params: [address, 'latest']
+            }),
+            signal: controller.signal
+        });
+
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+
+        if (data.error) {
+            throw new Error(data.error.message || 'RPC error');
+        }
+
+        if (!data.result) {
+            throw new Error('Empty RPC result');
+        }
+
+        const wei = BigInt(data.result);
+        const nativeAmount = Number(ethers.formatEther(wei));
+
+        return nativeAmount;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function fetchChainBalance(chainName, address) {
+    const urls = getRpcUrls(chainName);
+
+    if (urls.length === 0) {
+        console.log(`⚠️ No RPC URL configured for ${chainName}`);
+        return null;
+    }
+
+    const results = await Promise.allSettled(
+        urls.map(url => fetchNativeBalanceFromUrl(url, address))
+    );
+
+    const positive = results.find(
+        r => r.status === 'fulfilled' && r.value > 0
+    );
+
+    if (positive) {
+        return positive.value;
+    }
+
+    const zero = results.find(
+        r => r.status === 'fulfilled' && r.value === 0
+    );
+
+    if (zero) {
+        return zero.value;
+    }
+
+    const firstError = results.find(r => r.status === 'rejected');
+
+    console.log(
+        `⚠️ Could not fetch ${chainName} balance: ${firstError?.reason?.message || 'All RPCs failed'}`
+    );
+
+    return null;
+}
+
 async function fetchMultiChainBalances(address) {
     const balances = [];
     const chains = ['ethereum', 'bsc', 'polygon', 'arbitrum', 'base'];
 
-    const promises = chains.map(async (chainName) => {
-        try {
-            const provider = await getReliableProvider(chainName);
-            const bal = await Promise.race([
-                provider.getBalance(address),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))
-            ]);
-            const formatted = parseFloat(ethers.formatEther(bal));
+    const results = await Promise.all(
+        chains.map(async (chainName) => {
+            const amount = await fetchChainBalance(chainName, address);
+            return { chainName, amount };
+        })
+    );
 
-            if (formatted > 0) {
-                const symbol = chainName === 'bsc' ? 'BNB' :
-                    chainName === 'polygon' ? 'MATIC' : 'ETH';
-                balances.push({
-                    chain: chainName.charAt(0).toUpperCase() + chainName.slice(1),
-                    amount: formatted.toFixed(4),
-                    symbol: symbol
-                });
-            }
-        } catch (e) {
-            console.log(`⚠️ Could not fetch ${chainName} balance: ${e.message}`);
+    for (const item of results) {
+        if (item.amount !== null && item.amount > 0) {
+            balances.push({
+                chain: item.chainName.charAt(0).toUpperCase() + item.chainName.slice(1),
+                amount: item.amount.toFixed(4),
+                symbol: CHAIN_SYMBOLS[item.chainName] || 'ETH'
+            });
         }
-    });
+    }
 
-    await Promise.all(promises);
     return balances;
 }
 
