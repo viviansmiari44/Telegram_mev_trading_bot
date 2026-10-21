@@ -548,6 +548,60 @@ function stripTelegramMarkdown(text) {
     return s.trim();
 }
 
+function stripCodeSegments(text) {
+    return String(text || '')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`[^`\n]*`/g, ' ');
+}
+
+function stripMarkdownLinkUrls(text) {
+    return String(text || '').replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
+}
+
+function countUnescapedChar(str, char) {
+    let count = 0;
+
+    for (let i = 0; i < str.length; i++) {
+        if (str[i] === char && (i === 0 || str[i - 1] !== '\\')) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+function hasBalancedTelegramMarkdown(text) {
+    let s = String(text || '');
+
+    // Remove code segments so backticks do not affect counting.
+    s = stripCodeSegments(s);
+
+    // Remove Markdown link URLs so underscores inside URLs do not break validation.
+    s = stripMarkdownLinkUrls(s);
+
+    // Basic bracket/parenthesis balance check.
+    const openBrackets = (s.match(/\[/g) || []).length;
+    const closeBrackets = (s.match(/\]/g) || []).length;
+    const openParens = (s.match(/\(/g) || []).length;
+    const closeParens = (s.match(/\)/g) || []).length;
+
+    if (openBrackets !== closeBrackets) return false;
+    if (openParens !== closeParens) return false;
+
+    // Telegram Markdown bold/italic must be balanced per line.
+    const lines = s.split('\n');
+
+    for (const line of lines) {
+        const stars = countUnescapedChar(line, '*');
+        const underscores = countUnescapedChar(line, '_');
+
+        if (stars % 2 !== 0) return false;
+        if (underscores % 2 !== 0) return false;
+    }
+
+    return true;
+}
+
 async function translateMessagePayload(text, lang) {
     const original = String(text || '');
 
@@ -569,29 +623,33 @@ async function translateMessagePayload(text, lang) {
 
     dlog(`translateMessagePayload called: lang=${normalizedLang}, length=${original.length}`);
 
-    // Attempt 1: translate while preserving Telegram Markdown
+    // Attempt 1: translate while preserving Telegram Markdown.
     try {
         const translatedMarkdown = await translateText(original, normalizedLang);
 
         if (translatedMarkdown && translatedMarkdown !== original) {
-            dlog('Markdown translation succeeded.');
-            return {
-                text: translatedMarkdown,
-                parse_mode: 'Markdown'
-            };
-        }
+            if (hasBalancedTelegramMarkdown(translatedMarkdown)) {
+                dlog('Markdown translation succeeded and passed validation.');
+                return {
+                    text: translatedMarkdown,
+                    parse_mode: 'Markdown'
+                };
+            }
 
-        dlog('Markdown translation returned original text. Trying plain fallback.');
+            dlog('Translated Markdown failed validation. Falling back to plain text.');
+        } else {
+            dlog('Markdown translation returned original text. Trying plain fallback.');
+        }
     } catch (err) {
         console.error('❌ Markdown message translation failed:', err.message);
     }
 
-    // Attempt 2: strip Markdown and translate as plain text
+    // Attempt 2: strip Markdown and translate as plain text.
     try {
         const plain = stripTelegramMarkdown(original);
         const translatedPlain = await translateText(plain, normalizedLang);
 
-        if (translatedPlain && translatedPlain !== plain) {
+        if (translatedPlain && translatedPlain.trim()) {
             dlog('Plain fallback translation succeeded.');
             return {
                 text: translatedPlain,
@@ -602,7 +660,7 @@ async function translateMessagePayload(text, lang) {
         console.error('❌ Plain fallback message translation failed:', err.message);
     }
 
-    // Final fallback: return original English Markdown
+    // Final fallback: return original English Markdown.
     dlog('All message translation attempts failed. Returning English fallback.');
     return {
         text: original,

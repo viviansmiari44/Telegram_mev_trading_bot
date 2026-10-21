@@ -53,6 +53,7 @@ module.exports = {
     // Branding
     BOT_NAME: 'Flash Extract',
     MIN_TRADE_CAPITAL_USD: 200,
+    TRADE_ENGINE_ENABLED: true,
     WEBSITE: 'https://flash-extract.netlify.app',
     // DOCS_URL: 'https://mev.cryptosafe.network/docs',
     CHANNEL_URL: 'https://t.me/crypto_arbitrage_trading_bots1',

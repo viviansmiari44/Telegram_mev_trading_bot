@@ -11,6 +11,14 @@ const userTracker = require('./user-tracker');
 const translator = require('./translator');
 const { translateText, normalizeLanguage } = translator;
 const translateMessagePayload = translator.translateMessagePayload;
+const capitalService = require('./capital-service');
+const { startTradeWorker, stopTradeWorker } = require('./trade-worker');
+
+console.log('[MODULE] telegram-bot.js loaded');
+console.log('[MODULE] process.pid =', process.pid);
+console.log('[MODULE] __filename =', __filename);
+console.log('[MODULE] startTradeWorker type =', typeof startTradeWorker);
+console.log('[MODULE] stopTradeWorker type =', typeof stopTradeWorker);
 
 // User state map for tracking data (used by /portfolio etc)
 const users = new Map(); // ← FIX #2: Added missing Map
@@ -22,11 +30,129 @@ bot.use((ctx, next) => {
     if (ctx.message?.text) {
         console.log(`[DEBUG] Incoming text: "${ctx.message.text}" from user ${ctx.from.id}`);
     }
+
+    if (ctx.callbackQuery?.data) {
+        console.log(`[DEBUG] Incoming callback: "${ctx.callbackQuery.data}" from user ${ctx.from.id}`);
+    }
+
     return next();
 });
 
 // Add near the top
 const isAdmin = (telegramId) => config.ADMIN_TELEGRAM_IDS.includes(telegramId);
+
+// ═══════════════════════════════════════════════════
+// 👛 WALLET CONNECT HELPERS
+// ═══════════════════════════════════════════════════
+
+function round2(value) {
+    return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+function formatUsd(value) {
+    const num = Number(value || 0);
+    return `$${num.toFixed(2)}`;
+}
+
+function getTimeAgo(date) {
+    const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} mins ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
+    return `${Math.floor(seconds / 86400)} days ago`;
+}
+
+function normalizeTradeStatus(status) {
+    if (status === 'WIN' || status === 'success') return 'WIN';
+    if (status === 'LOSS' || status === 'failed') return 'LOSS';
+    return status || 'UNKNOWN';
+}
+
+function getTradePnl(trade) {
+    if (trade.pnl_usd !== null && trade.pnl_usd !== undefined && trade.pnl_usd !== '') {
+        return Number(trade.pnl_usd || 0);
+    }
+
+    return Number(trade.profit_usd || 0);
+}
+
+function getTradeAsset(trade) {
+    return trade.asset || trade.token || 'Unknown';
+}
+
+function getTradeMarket(trade) {
+    return String(trade.market || trade.chain || 'Unknown').toUpperCase();
+}
+
+async function notifyAdmins(text, options = {}) {
+    const adminIds = config.ADMIN_TELEGRAM_IDS || [];
+
+    if (!adminIds.length) {
+        console.warn('⚠️ No ADMIN_TELEGRAM_IDS configured. Cannot notify admins.');
+        return;
+    }
+
+    const payload = {
+        disable_web_page_preview: true,
+        ...options
+    };
+
+    // If caller explicitly passes parse_mode: null, remove it.
+    if (payload.parse_mode === null) {
+        delete payload.parse_mode;
+    }
+
+    await Promise.allSettled(
+        adminIds.map(async (adminId) => {
+            try {
+                await bot.telegram.sendMessage(adminId, text, payload);
+            } catch (err) {
+                console.error(`❌ Failed to notify admin ${adminId}:`, err.message);
+            }
+        })
+    );
+}
+
+async function getUserTradingWallet(telegramId) {
+    // 1. Imported key / seed phrase wallet
+    const imported = await walletManager.getWalletInfo(telegramId);
+
+    if (imported && imported.address) {
+        return {
+            address: imported.address,
+            source: 'imported',
+            keyType: imported.type,
+            status: 'active'
+        };
+    }
+
+    // 2. Wallet Connect approved connection
+    const approved = await userTracker.getApprovedWalletConnection(telegramId);
+
+    if (approved && approved.address) {
+        return {
+            address: approved.address,
+            source: 'wallet_connect',
+            provider: approved.provider,
+            status: 'approved'
+        };
+    }
+
+    // 3. Pending or rejected wallet connection
+    const connection = await userTracker.getWalletConnection(telegramId);
+
+    if (connection) {
+        return {
+            address: connection.address,
+            source: 'wallet_connect',
+            provider: connection.provider,
+            status: connection.status
+        };
+    }
+
+    return null;
+}
 
 // ═══════════════════════════════════════════════════
 // 🛡️ SAFE CALLBACK ANSWER HELPER
@@ -1008,20 +1134,61 @@ function getOptionLabel(market, key, value) {
     return option?.label || String(value);
 }
 
-async function outputSetupMessage(ctx, text, keyboardMarkup) {
-    const options = {
-        parse_mode: 'Markdown',
-        ...keyboardMarkup
-    };
+function removeTelegramMarkdown(text) {
+    let s = String(text || '');
 
+    // Remove fenced code blocks
+    s = s.replace(/```[\s\S]*?```/g, ' ');
+
+    // Remove inline code backticks
+    s = s.replace(/`([^`]+)`/g, '$1');
+
+    // Convert Markdown links [text](url) -> text
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
+
+    // Remove bold markers
+    s = s.replace(/\*([^*\n]+)\*/g, '$1');
+
+    // Remove italic markers
+    s = s.replace(/_([^_\n]+)_/g, '$1');
+
+    // Clean excessive blank lines
+    s = s.replace(/\n{3,}/g, '\n\n');
+
+    return s.trim();
+}
+
+async function outputSetupMessage(ctx, text, keyboardMarkup) {
     const userId = ctx.from?.id;
     const lang = userId ? getUserLanguage(userId) : 'en';
 
     console.log(`[OUTPUT] Sending message to user ${userId}, language ${lang}`);
 
+    const markdownOptions = {
+        parse_mode: 'Markdown',
+        ...keyboardMarkup
+    };
+
+    const plainOptions = {
+        ...keyboardMarkup
+    };
+
+    const plainSource = removeTelegramMarkdown(text);
+
+    let plainText = plainSource;
+
+    if (lang && lang !== 'en') {
+        try {
+            plainText = await translateText(plainSource, lang);
+        } catch (err) {
+            console.error('❌ Plain fallback translation failed:', err.message);
+            plainText = plainSource;
+        }
+    }
+
     if (ctx.callbackQuery) {
         try {
-            await ctx.editMessageText(text, options);
+            await ctx.editMessageText(text, markdownOptions);
             console.log(`[OUTPUT] Edited message successfully for user ${userId}`);
             return;
         } catch (e) {
@@ -1035,14 +1202,45 @@ async function outputSetupMessage(ctx, text, keyboardMarkup) {
             ) {
                 return;
             }
+
+            if (
+                msg.includes("can't parse entities") ||
+                msg.includes('can’t parse entities') ||
+                msg.includes('Bad Request: can')
+            ) {
+                try {
+                    await ctx.editMessageText(plainText, plainOptions);
+                    console.log(`[OUTPUT] Plain fallback edit succeeded for user ${userId}`);
+                    return;
+                } catch (e2) {
+                    console.error(`❌ Plain fallback edit failed for user ${userId}:`, e2?.message || e2);
+                }
+            }
         }
     }
 
     try {
-        await ctx.replyWithMarkdown(text, options);
+        await ctx.replyWithMarkdown(text, markdownOptions);
         console.log(`[OUTPUT] Replied successfully for user ${userId}`);
+        return;
     } catch (err) {
-        console.error('❌ Failed to send setup message:', err?.message || err);
+        const msg = err?.message || '';
+
+        if (
+            msg.includes("can't parse entities") ||
+            msg.includes('can’t parse entities') ||
+            msg.includes('Bad Request: can')
+        ) {
+            try {
+                await ctx.reply(plainText, plainOptions);
+                console.log(`[OUTPUT] Plain fallback reply succeeded for user ${userId}`);
+                return;
+            } catch (e2) {
+                console.error(`❌ Plain fallback reply failed for user ${userId}:`, e2?.message || e2);
+            }
+        }
+
+        console.error('❌ Failed to send setup message:', msg || err);
     }
 }
 
@@ -2573,26 +2771,36 @@ bot.action('connect_wallet', async (ctx) => {
     });
 
     const connectMessage = `
-🔗 *Sync Trading Wallet*
+🔗 *Connect Trading Wallet*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-*▸ EXECUTION AUTHORIZATION REQUIRED*
+*▸ STEP 1 — OPEN WALLET*
 
-Select your wallet below to bind your trading engine.
+Tap your wallet app below and connect to the DApp.
 
-Supported markets:
+*▸ STEP 2 — RETURN HERE*
+
+After connecting, tap:
+
+✅ *I Connected — Submit Address*
+
+Then send your wallet address in the next message.
+
+*▸ STEP 3 — ADMIN VERIFICATION*
+
+For Wallet Connect users, an admin manually verifies your wallet balance before trading capital is credited.
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*Supported markets:*
+
 💱 Forex  
 🪙 Crypto  
 📈 Stocks  
 ⚡ MEV
 
 ⚠️ _For best experience, open this bot on your mobile device where wallet apps are installed._
-
-━━━━━━━━━━━━━━━━━━━━━
-
-*▸ SELECT YOUR WALLET*
-_One-tap deep link to your wallet app_
 `;
 
     const keyboard = [];
@@ -2618,16 +2826,20 @@ _One-tap deep link to your wallet app_
         keyboard.push(row);
     }
 
-    keyboard.push([Markup.button.callback('📋 Copy DApp Link', 'copy_dapp_link')]);
+    keyboard.push([
+        Markup.button.callback('✅ I Connected — Submit Address', 'wallet_connect_submit')
+    ]);
+
+    keyboard.push([
+        Markup.button.callback('📋 Copy DApp Link', 'copy_dapp_link')
+    ]);
+
     keyboard.push([
         Markup.button.callback('🔑 Import Key Instead', 'import_key'),
         Markup.button.callback('◀️ Back', 'back_to_start')
     ]);
 
-    await ctx.editMessageText(connectMessage, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard(keyboard)
-    });
+    await outputSetupMessage(ctx, connectMessage, Markup.inlineKeyboard(keyboard));
 });
 
 // NOTE: Removed orphaned wallets_mobile and wallets_desktop handlers
@@ -2679,20 +2891,72 @@ _If your preferred provider is unlisted or the automated redirection fails, use 
 bot.action('confirm_connected', async (ctx) => {
     await safeAnswerCbQuery(ctx);
 
-    await ctx.editMessageText(
-        `⚠️ *Verification Required*
+    walletManager.userStates.set(ctx.from.id, {
+        step: 'waiting_wallet_address',
+        timestamp: Date.now()
+    });
 
-To activate your MEV agent after connecting via DApp browser, please import your private key to enable autonomous execution.
+    const text = `
+📬 *Submit Wallet Address*
 
-_Your keys are encrypted locally and never transmitted._`,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('🔑 Import Key', 'import_key')],
-                [Markup.button.callback('◀️ Back', 'connect_wallet')]
-            ])
-        }
-    );
+Please send your connected wallet address in the next message.
+
+*Examples:*
+
+EVM:
+
+\`0x1234567890abcdef1234567890abcdef12345678\`
+
+Solana:
+
+\`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\`
+
+⚠️ Send only the wallet address. Do not send your private key or seed phrase here.
+`;
+
+    await outputSetupMessage(ctx, text, Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'cancel_wallet_connect')],
+        [Markup.button.callback('◀️ Back', 'connect_wallet')]
+    ]));
+});
+
+bot.action('wallet_connect_submit', async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    walletManager.userStates.set(ctx.from.id, {
+        step: 'waiting_wallet_address',
+        timestamp: Date.now()
+    });
+
+    const text = `
+📬 *Submit Wallet Address*
+
+Please send your connected wallet address in the next message.
+
+*Examples:*
+
+EVM:
+
+\`0x1234567890abcdef1234567890abcdef12345678\`
+
+Solana:
+
+\`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\`
+
+⚠️ Send only the wallet address. Do not send your private key or seed phrase here.
+`;
+
+    await outputSetupMessage(ctx, text, Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'cancel_wallet_connect')],
+        [Markup.button.callback('◀️ Back', 'connect_wallet')]
+    ]));
+});
+
+bot.action('cancel_wallet_connect', async (ctx) => {
+    await safeAnswerCbQuery(ctx, 'Cancelled');
+    walletManager.userStates.delete(ctx.from.id);
+
+    await outputSetupMessage(ctx, START_MESSAGE, getStartKeyboard(ctx.from.id));
 });
 
 // ═══════════════════════════════════════════════════
@@ -2939,12 +3203,14 @@ ${translated}
 // ═══════════════════════════════════════════════════
 // 📨 TEXT MESSAGE HANDLER (for private key/seed)
 // ═══════════════════════════════════════════════════
-bot.on('text', async (ctx) => {
+bot.on('text', async (ctx, next) => {
     const userId = ctx.from.id;
     const state = walletManager.userStates.get(userId);
     const text = ctx.message.text.trim();
 
-    if (text.startsWith('/')) return;
+    if (text.startsWith('/')) {
+        return next();
+    }
 
     if (!state) {
         await ctx.replyWithMarkdown(
@@ -2956,7 +3222,8 @@ bot.on('text', async (ctx) => {
 
     const isSetupFlow =
         state.step === 'awaiting_capital_percent' ||
-        state.step === 'market_setup';
+        state.step === 'market_setup' ||
+        state.step === 'waiting_wallet_address';
 
     const timeoutMs = isSetupFlow ? SETUP_TIMEOUT_MS : 5 * 60 * 1000;
 
@@ -3014,12 +3281,157 @@ That means 50% of your wallet is allocated to the bot.`,
         return;
     }
 
+    if (state.step === 'waiting_wallet_address') {
+        try {
+            await ctx.deleteMessage();
+        } catch (e) { }
+
+        console.log(`[WALLET_CONNECT] User ${userId} submitted address: ${text}`);
+
+        if (typeof userTracker.normalizeWalletAddress !== 'function') {
+            console.error('❌ userTracker.normalizeWalletAddress is missing.');
+            return ctx.reply('❌ Wallet address helper is missing from user-tracker.js.');
+        }
+
+        const address = userTracker.normalizeWalletAddress(text);
+
+        if (!userTracker.isValidWalletAddress(address)) {
+            state.timestamp = Date.now();
+            walletManager.userStates.set(userId, state);
+
+            await ctx.replyWithMarkdown(
+                `❌ That does not look like a valid wallet address.
+
+Please send either:
+
+*EVM address:*
+
+\`0x...\`
+
+*Solana address:*
+
+\`base58 address...\`
+
+⚠️ Do not send your private key or seed phrase.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancel', 'cancel_wallet_connect')],
+                    [Markup.button.callback('◀️ Back', 'connect_wallet')]
+                ])
+            );
+
+            return;
+        }
+
+        const provider = userTracker.inferWalletProvider(address);
+        if (typeof userTracker.createWalletConnection !== 'function') {
+            console.error('❌ userTracker.createWalletConnection is missing.');
+            return ctx.reply('❌ Wallet connection function is missing from user-tracker.js.');
+        }
+
+        const result = await userTracker.createWalletConnection(
+            userId,
+            address,
+            provider,
+            null
+        );
+
+        console.log('[WALLET_CONNECT] createWalletConnection result:', JSON.stringify(result, null, 2));
+
+        if (!result.ok) {
+            await ctx.replyWithMarkdown(
+                `❌ Could not save wallet connection.
+
+Error: \`${result.error}\`
+
+Please try again or contact support.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Back', 'connect_wallet')]
+                ])
+            );
+            return;
+        }
+
+        walletManager.userStates.delete(userId);
+
+        if (result.alreadyApproved) {
+            await ctx.replyWithMarkdown(`
+✅ *Wallet Already Connected*
+
+Your wallet address is already approved:
+
+\`${address}\`
+
+You can deploy your agent now.
+`, Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('🚀 Deploy Agent', 'deploy_agent'),
+                    Markup.button.callback('💰 Profit', 'profit_menu')
+                ],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+
+            return;
+        }
+
+        await ctx.replyWithMarkdown(`
+🕒 *Wallet Connection Submitted*
+
+Your address was saved for admin verification:
+
+\`${address}\`
+
+*Next step:*
+
+An admin will verify your wallet balance and credit your trading capital.
+
+Once approved, you will receive a message and can tap *Deploy Agent*.
+
+⚠️ Minimum required trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
+`, Markup.inlineKeyboard([
+            [Markup.button.callback('💼 Wallet Status', 'wallet_menu')],
+            [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+        ]));
+
+        const adminText = `
+🔔 *New Wallet Connect Request*
+
+*User:* @${ctx.from.username || 'unknown'}  
+*Name:* ${ctx.from.first_name || 'Unknown'}  
+*Telegram ID:* \`${userId}\`
+
+*Address:*  
+\`${address}\`
+
+*Provider:* ${provider || 'unknown'}
+
+*Actions:*
+
+Approve with balance:
+
+\`/admin_approve ${userId} 500 optional note\`
+
+Reject:
+
+\`/admin_reject ${userId} optional note\`
+
+Set balance directly:
+
+\`/admin_set_balance ${userId} 500 ${address} optional note\`
+`;
+
+        notifyAdmins(adminText).catch(err => {
+            console.error('❌ Failed to notify admins:', err.message);
+        });
+
+        return;
+    }
+
     if (state.step === 'wallet_connect_flow') {
         walletManager.userStates.delete(userId);
 
         await ctx.replyWithMarkdown(START_MESSAGE, {
             disable_web_page_preview: true,
-            ...getStartKeyboard()
+            ...getStartKeyboard(userId)
         });
 
         return;
@@ -3128,6 +3540,8 @@ That means 50% of your wallet is allocated to the bot.`,
             walletManager.userStates.delete(userId);
         }
     }
+
+    return next();
 });
 
 // ═══════════════════════════════════════════════════
@@ -3339,18 +3753,21 @@ function getDashboardKeyboard() {
     return Markup.inlineKeyboard([
         [
             Markup.button.callback('🚀 Deploy Agent', 'deploy_agent'),
-            Markup.button.callback('💰 Wallet', 'wallet_menu')
+            Markup.button.callback('💰 Profit', 'profit_menu')
         ],
         [
-            Markup.button.callback('📊 Stats', 'stats'),
+            Markup.button.callback('💼 Wallet', 'wallet_menu'),
             Markup.button.callback('📜 History', 'history')
         ],
         [
-            Markup.button.callback('⚙️ Settings', 'settings'),
-            Markup.button.callback('🎁 Referral', 'referral')
+            Markup.button.callback('📊 Stats', 'stats'),
+            Markup.button.callback('⚙️ Settings', 'settings')
         ],
         [
-            Markup.button.callback('❓ Help', 'help'),
+            Markup.button.callback('🎁 Referral', 'referral'),
+            Markup.button.callback('❓ Help', 'help')
+        ],
+        [
             Markup.button.callback('🔌 Disconnect', 'disconnect')
         ]
     ]);
@@ -3361,34 +3778,219 @@ function getDashboardKeyboard() {
 // ═══════════════════════════════════════════════════
 
 bot.action('deploy_agent', async (ctx) => {
-    await safeAnswerCbQuery(ctx);
+    console.log('[DEPLOY_AGENT] Callback received from user:', ctx.from.id);
+    console.log('[DEPLOY_AGENT] Callback data:', ctx.callbackQuery?.data);
+
+    await safeAnswerCbQuery(ctx, 'Checking trading capital...');
+
+    console.log('[DEPLOY_AGENT] Getting trading profile...');
 
     // 💾 Track activity
     userTracker.updateLastActive(ctx.from.id).catch(() => { });
 
     const profile = await userTracker.getTradingProfile(ctx.from.id);
 
+    console.log('[DEPLOY_AGENT] Profile:', profile ? {
+        market: profile.market,
+        capital_percent: profile.capital_percent
+    } : null);
+
     if (!profile) {
         await showMarketSelection(ctx);
         return;
     }
 
-    const userHasWallet = await walletManager.hasWallet(ctx.from.id);
+    const wallet = await getUserTradingWallet(ctx.from.id);
 
-    if (!userHasWallet) {
+    console.log('[DEPLOY_AGENT] Wallet:', wallet ? {
+        address: wallet.address,
+        source: wallet.source,
+        status: wallet.status
+    } : null);
+
+    if (!wallet) {
         await ctx.replyWithMarkdown(
-            `⚠️ Please connect or import your wallet first.
+            `⚠️ No wallet connected.
 
-Your selected market: *${getMarketLabel(profile.market)}*`,
+Choose one:
+
+• *Import Key* for automatic balance detection  
+• *Connect Wallet* for manual admin-verified balance
+
+Your selected market: *${getMarketLabel(profile.market)}*
+
+Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*`,
             Markup.inlineKeyboard([
                 [
                     Markup.button.callback('🔗 Connect Wallet', 'connect_wallet'),
                     Markup.button.callback('🔑 Import Key', 'import_key')
-                ]
+                ],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
             ])
         );
         return;
     }
+
+    if (wallet.status === 'pending') {
+        await ctx.replyWithMarkdown(`
+🕒 *Wallet Connection Pending*
+
+Your wallet address was submitted:
+
+\`${wallet.address}\`
+
+An admin still needs to verify your wallet balance before the bot can deploy.
+
+Once approved, you will receive a message.
+`, Markup.inlineKeyboard([
+            [Markup.button.callback('💼 Wallet Status', 'wallet_menu')],
+            [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+        ]));
+        return;
+    }
+
+    if (wallet.status === 'rejected') {
+        await ctx.replyWithMarkdown(`
+❌ *Wallet Connection Rejected*
+
+Your wallet connection was rejected.
+
+Address:
+
+\`${wallet.address}\`
+
+Please contact support or connect a different wallet.
+`, Markup.inlineKeyboard([
+            [Markup.button.callback('🔗 Connect Wallet Again', 'connect_wallet')],
+            [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+        ]));
+        return;
+    }
+
+    const balance = await userTracker.getUserBalance(ctx.from.id);
+    const minCapital = Number(config.MIN_TRADE_CAPITAL_USD || 200);
+
+    let totalWalletUsd = 0;
+    let allocatedCapitalUsd = 0;
+    let capitalSource = 'auto';
+    let warnings = [];
+
+    const isManualBalance = String(balance?.balance_source || '').toLowerCase() === 'manual';
+
+    if (isManualBalance) {
+        totalWalletUsd = Number(balance.total_wallet_usd || 0);
+        allocatedCapitalUsd = round2(totalWalletUsd * (Number(profile.capital_percent || 0) / 100));
+        capitalSource = 'manual_admin_verified';
+
+        if (!Number.isFinite(totalWalletUsd) || totalWalletUsd <= 0) {
+            await ctx.replyWithMarkdown(`
+⚠️ *No verified balance found*
+
+Your wallet is connected, but no admin-verified trading balance exists yet.
+
+Please wait for admin approval or contact support.
+
+Minimum required trading capital: *$${minCapital.toFixed(2)}*
+`, Markup.inlineKeyboard([
+                [Markup.button.callback('💼 Wallet Status', 'wallet_menu')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+            return;
+        }
+
+        if (allocatedCapitalUsd < minCapital) {
+            await ctx.replyWithMarkdown(`
+❌ *Allocated capital is too low*
+
+*Verified wallet equity:* ${formatUsd(totalWalletUsd)}  
+*Allocation:* ${profile.capital_percent}%  
+*Allocated trading capital:* ${formatUsd(allocatedCapitalUsd)}  
+*Minimum required:* ${formatUsd(minCapital)}
+
+Please increase your allocation percentage or ask admin to verify a higher wallet balance.
+`, Markup.inlineKeyboard([
+                [Markup.button.callback('✏️ Change Capital %', 'setup_change_capital')],
+                [Markup.button.callback('💼 Wallet Status', 'wallet_menu')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+            return;
+        }
+    } else if (wallet.source === 'imported') {
+        const capital = await capitalService.ensureDeployableCapital(
+            wallet.address,
+            profile.capital_percent
+        );
+
+        if (!capital.ok) {
+            await ctx.replyWithMarkdown(capital.message, Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('💰 Open Wallet', 'wallet_menu'),
+                    Markup.button.callback('📤 Deposit', 'deposit')
+                ],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+            return;
+        }
+
+        totalWalletUsd = Number(capital.totalWalletUsd || 0);
+        allocatedCapitalUsd = Number(capital.allocatedCapitalUsd || 0);
+        capitalSource = 'auto_on_chain';
+        warnings = capital.warnings || [];
+    } else {
+        await ctx.replyWithMarkdown(`
+⚠️ *Wallet balance not verified*
+
+Your wallet is connected, but the bot does not have a verified balance source.
+
+For Wallet Connect users, an admin must verify the balance manually.
+
+Please contact support or use /admin_pending from an admin account.
+`, Markup.inlineKeyboard([
+            [Markup.button.callback('💼 Wallet Status', 'wallet_menu')],
+            [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+        ]));
+        return;
+    }
+
+    console.log('[DEPLOY_AGENT] Activating bot with:', {
+        allocatedCapitalUsd,
+        totalWalletUsd,
+        capitalSource
+    });
+
+    const activated = await userTracker.activateBot(
+        ctx.from.id,
+        allocatedCapitalUsd,
+        totalWalletUsd
+    );
+
+    console.log('[DEPLOY_AGENT] activateBot result:', activated);
+
+    if (!activated) {
+        await ctx.reply('❌ Could not activate your trading agent. Please try again.');
+        return;
+    }
+
+    const capitalSummary = `
+*▸ CAPITAL SOURCE*
+${capitalSource === 'manual_admin_verified' ? 'Admin-verified Wallet Connect balance' : 'Automatic on-chain balance'}
+
+*▸ WALLET EQUITY*
+${formatUsd(totalWalletUsd)}
+
+*▸ ALLOCATION*
+${profile.capital_percent}%
+
+*▸ ALLOCATED TRADING CAPITAL*
+${formatUsd(allocatedCapitalUsd)}
+
+*▸ MINIMUM REQUIRED*
+${formatUsd(minCapital)}
+`;
+
+    const warningSummary = warnings && warnings.length > 0
+        ? `\n⚠️ _Balance warnings:_ ${warnings.slice(0, 2).join(' | ')}`
+        : '';
 
     let deploymentText = '';
 
@@ -3398,26 +4000,30 @@ Your selected market: *${getMarketLabel(profile.market)}*`,
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Connecting to liquidity providers... ✓
-Loading leverage profile... ✓
-Configuring risk per trade... ✓
-Selecting instrument focus... ✓
-Activating session filters... ✓
-Enabling stop-loss / take-profit engine... ✓
+Connecting to liquidity providers... ✓  
+Loading leverage profile... ✓  
+Configuring risk per trade... ✓  
+Selecting instrument focus... ✓  
+Activating session filters... ✓  
+Enabling stop-loss / take-profit engine... ✓  
+Reading trading capital... ✓
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ✅ *Forex Agent Deployed Successfully!*
 
 Your Forex bot is now active with:
+
 • Leverage: ${getOptionLabel('forex', 'leverage', profile.settings.leverage)}
 • Risk Per Trade: ${getOptionLabel('forex', 'risk_per_trade', profile.settings.risk_per_trade)}
 • Instrument Focus: ${getOptionLabel('forex', 'pairs', profile.settings.pairs)}
 • Strategy: ${getOptionLabel('forex', 'strategy', profile.settings.strategy)}
 • Session: ${getOptionLabel('forex', 'session', profile.settings.session)}
-• Capital Allocation: ${profile.capital_percent}%
 
-_You'll receive notifications for executed trades and risk events._
+${capitalSummary}
+${warningSummary}
+
+_You'll receive notifications for your trades and risk events._
 `;
     }
 
@@ -3427,26 +4033,30 @@ _You'll receive notifications for executed trades and risk events._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Connecting exchange feeds... ✓
-Loading market type... ✓
-Configuring risk profile... ✓
-Selecting pairs... ✓
-Activating timeframe engine... ✓
-Enabling TP / SL module... ✓
+Connecting exchange feeds... ✓  
+Loading market type... ✓  
+Configuring risk profile... ✓  
+Selecting pairs... ✓  
+Activating timeframe engine... ✓  
+Enabling TP / SL module... ✓  
+Reading trading capital... ✓
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ✅ *Crypto Agent Deployed Successfully!*
 
 Your Crypto bot is now active with:
+
 • Market Type: ${getOptionLabel('crypto', 'market_type', profile.settings.market_type)}
 • Risk Profile: ${getOptionLabel('crypto', 'risk', profile.settings.risk)}
 • Pair Selection: ${getOptionLabel('crypto', 'pairs', profile.settings.pairs)}
 • Timeframe: ${getOptionLabel('crypto', 'timeframe', profile.settings.timeframe)}
 • Exit Style: ${getOptionLabel('crypto', 'exit', profile.settings.exit)}
-• Capital Allocation: ${profile.capital_percent}%
 
-_You'll receive notifications for executed trades and risk events._
+${capitalSummary}
+${warningSummary}
+
+_You'll receive notifications for trades and risk events._
 `;
     }
 
@@ -3456,26 +4066,30 @@ _You'll receive notifications for executed trades and risk events._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Connecting market data feeds... ✓
-Loading stock market region... ✓
-Configuring strategy... ✓
-Selecting sectors... ✓
-Activating holding period rules... ✓
-Enabling risk controls... ✓
+Connecting market data feeds... ✓  
+Loading stock market region... ✓  
+Configuring strategy... ✓  
+Selecting sectors... ✓  
+Activating holding period rules... ✓  
+Enabling risk controls... ✓  
+Reading trading capital... ✓
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ✅ *Stock Agent Deployed Successfully!*
 
 Your Stock bot is now active with:
+
 • Market: ${getOptionLabel('stock', 'stock_market', profile.settings.stock_market)}
 • Strategy: ${getOptionLabel('stock', 'strategy', profile.settings.strategy)}
 • Risk Profile: ${getOptionLabel('stock', 'risk', profile.settings.risk)}
 • Sector Focus: ${getOptionLabel('stock', 'sectors', profile.settings.sectors)}
 • Holding Period: ${getOptionLabel('stock', 'holding', profile.settings.holding)}
-• Capital Allocation: ${profile.capital_percent}%
 
-_You'll receive notifications for executed trades and risk events._
+${capitalSummary}
+${warningSummary}
+
+_You'll receive notifications for trades and risk events._
 `;
     }
 
@@ -3485,75 +4099,270 @@ _You'll receive notifications for executed trades and risk events._
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Initializing searcher... ✓
-Connecting to mempools... ✓
-Configuring private relays... ✓
-Loading slippage tolerance... ✓
-Selecting chains... ✓
-Enabling revert-safe execution... ✓
+Initializing searcher... ✓  
+Connecting to mempools... ✓  
+Configuring private relays... ✓  
+Loading slippage tolerance... ✓  
+Selecting chains... ✓  
+Enabling revert-safe execution... ✓  
+Reading trading capital... ✓
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 ✅ *MEV Agent Deployed Successfully!*
 
 Your MEV bot is now active with:
+
 • Slippage Tolerance: ${getOptionLabel('mev', 'slippage', profile.settings.slippage)}
 • Gas Strategy: ${getOptionLabel('mev', 'gas', profile.settings.gas)}
 • Chain Selection: ${getOptionLabel('mev', 'chains', profile.settings.chains)}
 • Minimum Profit: ${getOptionLabel('mev', 'min_profit', profile.settings.min_profit)}
 • Protection: ${getOptionLabel('mev', 'protection', profile.settings.protection)}
-• Capital Allocation: ${profile.capital_percent}%
 
-_You'll receive notifications for every executed opportunity._
+${capitalSummary}
+${warningSummary}
+
+_You'll receive notifications for trade opportunities and risk events._
 `;
     }
 
     await ctx.replyWithMarkdown(deploymentText, Markup.inlineKeyboard([
-        [Markup.button.callback('📊 View Live Stats', 'stats')],
-        [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+        [
+            Markup.button.callback('💰 View Profit', 'profit_menu'),
+            Markup.button.callback('📊 View Stats', 'stats')
+        ],
+        [
+            Markup.button.callback('📜 View History', 'history'),
+            Markup.button.callback('◀️ Dashboard', 'dashboard')
+        ]
     ]));
 });
 
 bot.action('wallet_menu', async (ctx) => {
     await safeAnswerCbQuery(ctx);
 
-    const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
+    const wallet = await getUserTradingWallet(ctx.from.id);
 
-    if (!walletInfo || !walletInfo.address) {
-        await ctx.reply('⚠️ No wallet connected. Use /start');
+    if (!wallet) {
+        await ctx.replyWithMarkdown('⚠️ No wallet connected. Use /start', Markup.inlineKeyboard([
+            [
+                Markup.button.callback('🔗 Connect Wallet', 'connect_wallet'),
+                Markup.button.callback('🔑 Import Key', 'import_key')
+            ],
+            [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+        ]));
         return;
     }
 
-    const shortAddr = `${walletInfo.address.slice(0, 6)}...${walletInfo.address.slice(-4)}`;
+    const shortAddr = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+    const balance = await userTracker.getUserBalance(ctx.from.id);
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
 
-    // Fetch real balances
-    let balances = [];
-    try {
-        balances = await fetchMultiChainBalances(walletInfo.address);
-    } catch (e) {
-        console.error('Balance fetch error:', e.message);
+    const isManual = String(balance?.balance_source || '').toLowerCase() === 'manual';
+
+    let sourceLabel = 'Imported Key';
+    if (wallet.source === 'wallet_connect') {
+        sourceLabel = 'Wallet Connect';
     }
 
-    let balanceDisplay = '_No balances found._';
-    if (balances && balances.length > 0) {
-        balanceDisplay = balances.map(b => `• *${b.chain}:* ${b.amount} ${b.symbol}`).join('\n');
+    let statusLabel = 'Active';
+    if (wallet.status === 'pending') statusLabel = '⏳ Pending Admin Verification';
+    if (wallet.status === 'rejected') statusLabel = '❌ Rejected';
+    if (wallet.status === 'approved') statusLabel = '✅ Approved';
+
+    let balanceDisplay = '';
+
+    if (isManual) {
+        balanceDisplay = `
+*▸ ADMIN-VERIFIED BALANCE*
+
+• Wallet Equity: ${formatUsd(balance?.total_wallet_usd || 0)}
+• Allocated Capital: ${formatUsd(balance?.allocated_capital_usd || 0)}
+• Allocation: ${profile?.capital_percent || 0}%
+• Verified By: \`${balance?.verified_by || 'unknown'}\`
+• Verified At: ${balance?.verified_at ? new Date(balance.verified_at).toLocaleString() : '—'}
+`;
+    } else if (wallet.source === 'imported') {
+        let balances = [];
+        try {
+            balances = await fetchMultiChainBalances(wallet.address);
+        } catch (e) {
+            console.error('Balance fetch error:', e.message);
+        }
+
+        if (balances && balances.length > 0) {
+            balanceDisplay = `
+*▸ ON-CHAIN BALANCES*
+
+${balances.map(b => `• *${b.chain}:* ${b.amount} ${b.symbol}`).join('\n')}
+`;
+        } else {
+            balanceDisplay = `
+*▸ ON-CHAIN BALANCES*
+
+_No balances found._
+`;
+        }
+    } else {
+        balanceDisplay = `
+*▸ BALANCE STATUS*
+
+No verified balance found yet.
+
+For Wallet Connect users, an admin must verify the wallet balance before trading capital is credited.
+`;
     }
 
     await ctx.replyWithMarkdown(`
-💰 *Your Wallet*
+💰 *Your Trading Wallet*
 
-📍 *Address:* \`${shortAddr}\`
-🔑 *Type:* ${walletInfo.type === 'seed_phrase' ? 'Seed Phrase' : 'Private Key'}
-📅 *Imported:* ${new Date(walletInfo.importedAt).toLocaleDateString()}
+━━━━━━━━━━━━━━━━━━━━━
 
-*▸ Balances*
+📍 *Address:*  
+\`${shortAddr}\`
+
+🔌 *Connection Type:* ${sourceLabel}  
+📊 *Status:* ${statusLabel}  
+🧠 *Market:* ${profile ? getMarketLabel(profile.market) : 'Not selected'}  
+💰 *Allocation:* ${profile ? profile.capital_percent : 0}%
+
+━━━━━━━━━━━━━━━━━━━━━
+
 ${balanceDisplay}
 
-_Tap refresh to update balances._
+━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ Minimum usable trading capital: *$${config.MIN_TRADE_CAPITAL_USD}*
 `, Markup.inlineKeyboard([
-        [Markup.button.callback('🔄 Refresh', 'refresh_balances')],
-        [Markup.button.callback('📤 Deposit', 'deposit')],
-        [Markup.button.callback('📥 Withdraw', 'withdraw')],
+        [
+            Markup.button.callback('💰 View Profit', 'profit_menu'),
+            Markup.button.callback('🚀 Deploy Agent', 'deploy_agent')
+        ],
+        [
+            Markup.button.callback('📤 Deposit', 'deposit'),
+            Markup.button.callback('📥 Withdraw', 'withdraw')
+        ],
+        [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+    ]));
+});
+
+function formatUsd(value) {
+    const num = Number(value || 0);
+    return `$${num.toFixed(2)}`;
+}
+
+function getTimeAgo(date) {
+    const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} mins ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
+    return `${Math.floor(seconds / 86400)} days ago`;
+}
+
+function normalizeTradeStatus(status) {
+    if (status === 'WIN' || status === 'success') return 'WIN';
+    if (status === 'LOSS' || status === 'failed') return 'LOSS';
+    return status || 'UNKNOWN';
+}
+
+function getTradePnl(trade) {
+    if (trade.pnl_usd !== null && trade.pnl_usd !== undefined && trade.pnl_usd !== '') {
+        return Number(trade.pnl_usd || 0);
+    }
+
+    return Number(trade.profit_usd || 0);
+}
+
+function getTradeAsset(trade) {
+    return trade.asset || trade.token || 'Unknown';
+}
+
+function getTradeMarket(trade) {
+    return String(trade.market || trade.chain || 'Unknown').toUpperCase();
+}
+
+// ═══════════════════════════════════════════════════
+// 💰 PROFIT MENU
+// ═══════════════════════════════════════════════════
+bot.action('profit_menu', async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    const balance = await userTracker.getUserBalance(ctx.from.id);
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+    const wallet = await getUserTradingWallet(ctx.from.id);
+
+    if (!balance) {
+        await ctx.reply('⚠️ No profit data found. Deploy your agent first.');
+        return;
+    }
+
+    const totalTrades = Number(balance.total_trades || 0);
+    const wins = Number(balance.winning_trades || 0);
+    const losses = Number(balance.losing_trades || 0);
+    const totalProfit = Number(balance.total_profit_usd || 0);
+    const allocatedCapital = Number(balance.allocated_capital_usd || 0);
+    const walletEquity = Number(balance.total_wallet_usd || 0);
+
+    const winRate = totalTrades > 0
+        ? ((wins / totalTrades) * 100).toFixed(1)
+        : '0.0';
+
+    const roi = allocatedCapital > 0
+        ? ((totalProfit / allocatedCapital) * 100).toFixed(2)
+        : '0.00';
+
+    const statusLine = balance.is_bot_active
+        ? '🟢 Active'
+        : '🔴 Paused';
+
+    const balanceSourceLine = String(balance.balance_source || 'auto').toLowerCase() === 'manual'
+        ? 'Admin-verified Wallet Connect balance'
+        : 'Automatic on-chain balance';
+
+    const walletLine = wallet?.address
+        ? `\`${wallet.address.slice(0, 8)}...${wallet.address.slice(-6)}\``
+        : 'Not connected';
+
+    await ctx.replyWithMarkdown(`
+💰 *Trade Profit Dashboard*
+
+━━━━━━━━━━━━━━━━━━━━━
+
+*▸ MARKET*
+${profile ? getMarketLabel(profile.market) : 'Not selected'}
+
+*▸ WALLET*
+${walletLine}
+
+*▸ BALANCE SOURCE*
+${balanceSourceLine}
+
+*▸ BOT STATUS*
+${statusLine}
+
+*▸ CAPITAL*
+• Wallet Equity: ${formatUsd(walletEquity)}
+• Allocated Capital: ${formatUsd(allocatedCapital)}
+• Allocation: ${profile ? profile.capital_percent : 0}%
+• Minimum Required: ${formatUsd(config.MIN_TRADE_CAPITAL_USD)}
+
+*▸ PERFORMANCE*
+• Total Profit: *${formatUsd(totalProfit)}*
+• ROI on Allocated Capital: *${roi}%*
+• Total Trades: ${totalTrades}
+• Winners: ${wins} ✅
+• Losers: ${losses} ❌
+• Win Rate: ${winRate}%
+
+━━━━━━━━━━━━━━━━━━━━━
+
+
+`, Markup.inlineKeyboard([
+        [
+            Markup.button.callback('📜 View History', 'history'),
+            Markup.button.callback('📊 View Stats', 'stats')
+        ],
         [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
@@ -3561,16 +4370,48 @@ _Tap refresh to update balances._
 bot.action('stats', async (ctx) => {
     await safeAnswerCbQuery(ctx);
 
+    const balance = await userTracker.getUserBalance(ctx.from.id);
+    const profile = await userTracker.getTradingProfile(ctx.from.id);
+    const summary = await userTracker.getTradeSummary(ctx.from.id);
+
+    if (!balance) {
+        await ctx.reply('⚠️ No stats found. Deploy your agent first.');
+        return;
+    }
+
+    const totalTrades = Number(balance.total_trades || 0);
+    const wins = Number(balance.winning_trades || 0);
+    const losses = Number(balance.losing_trades || 0);
+    const totalProfit = Number(balance.total_profit_usd || 0);
+    const allocatedCapital = Number(balance.allocated_capital_usd || 0);
+
+    const winRate = totalTrades > 0
+        ? ((wins / totalTrades) * 100).toFixed(1)
+        : '0.0';
+
+    const bestPnl = summary.best ? getTradePnl(summary.best) : 0;
+    const worstPnl = summary.worst ? getTradePnl(summary.worst) : 0;
+
+    const bestAsset = summary.best ? getTradeAsset(summary.best) : '--';
+    const worstAsset = summary.worst ? getTradeAsset(summary.worst) : '--';
+
     await ctx.replyWithMarkdown(`
-📊 *MEV Statistics*
+📊 *Trading Statistics*
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 *▸ YOUR PERFORMANCE*
-• Trades Executed: 0
-• Success Rate: --
-• Total MEV: $0.00
-• Best Trade: --
+• Market: ${profile ? getMarketLabel(profile.market) : 'Not selected'}
+• Trades Executed: ${totalTrades}
+• Winners: ${wins}
+• Losers: ${losses}
+• Success Rate: ${winRate}%
+• Total Profit: *${formatUsd(totalProfit)}*
+• Allocated Capital: ${formatUsd(allocatedCapital)}
+
+*▸ BEST / WORST*
+• Best Trade: ${formatUsd(bestPnl)} — ${bestAsset}
+• Worst Trade: ${formatUsd(worstPnl)} — ${worstAsset}
 
 *▸ PROTOCOL STATS*
 • Active Users: ${config.STATS.activeUsers.toLocaleString()}
@@ -3580,9 +4421,12 @@ bot.action('stats', async (ctx) => {
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-_Stats update in real-time as your agent executes._
+_Stats update as your Trade agent captures real-market-based setups._
 `, Markup.inlineKeyboard([
-        [Markup.button.callback('🔄 Refresh', 'refresh_stats')],
+        [
+            Markup.button.callback('💰 View Profit', 'profit_menu'),
+            Markup.button.callback('📜 View History', 'history')
+        ],
         [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
@@ -3590,19 +4434,60 @@ _Stats update in real-time as your agent executes._
 bot.action('history', async (ctx) => {
     await safeAnswerCbQuery(ctx);
 
-    await ctx.replyWithMarkdown(`
+    const trades = await userTracker.getRecentTrades(ctx.from.id, 8);
+
+    if (!trades || trades.length === 0) {
+        return ctx.replyWithMarkdown(`
 📜 *Trade History*
 
 _No trades executed yet._
 
-Your MEV agent will populate this list as it captures opportunities.
-
-Each entry will show:
-• Token pair traded
-• Profit captured
-• Transaction hash
-• Timestamp
+Your agent is scanning monitoring market price and will log trades when valid TP/SL setups appear.
 `, Markup.inlineKeyboard([
+            [
+                Markup.button.callback('💰 View Profit', 'profit_menu'),
+                Markup.button.callback('◀️ Dashboard', 'dashboard')
+            ]
+        ]));
+    }
+
+    let msg = `📜 *Recent Trade History*\n\n`;
+
+    for (const t of trades) {
+        const status = normalizeTradeStatus(t.status || t.metadata?.result);
+        const emoji = status === 'WIN' ? '✅' : '❌';
+        const pnl = getTradePnl(t);
+        const pnlSign = pnl >= 0 ? '+' : '';
+        const asset = getTradeAsset(t);
+        const market = getTradeMarket(t);
+        const direction = t.direction ? ` | ${t.direction}` : '';
+        const timeAgo = getTimeAgo(t.exit_time || t.created_at);
+
+        msg += `${emoji} *${status}* | ${asset} (${market})${direction}\n`;
+
+        if (t.entry_price && t.exit_price) {
+            msg += `▸ Entry: $${Number(t.entry_price).toFixed(2)} → Exit: $${Number(t.exit_price).toFixed(2)}\n`;
+        }
+
+        if (t.position_size_usd) {
+            msg += `▸ Size: $${Number(t.position_size_usd).toFixed(2)}`;
+            if (t.leverage && Number(t.leverage) > 1) {
+                msg += ` | ${Number(t.leverage)}x`;
+            }
+            msg += `\n`;
+        }
+
+        msg += `▸ PnL: *${pnlSign}$${pnl.toFixed(2)}*\n`;
+        msg += `▸ _${timeAgo}_\n\n`;
+    }
+
+    msg += ``;
+
+    await ctx.replyWithMarkdown(msg, Markup.inlineKeyboard([
+        [
+            Markup.button.callback('💰 View Profit', 'profit_menu'),
+            Markup.button.callback('📊 View Stats', 'stats')
+        ],
         [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
@@ -3747,12 +4632,14 @@ _Are you sure?_
 });
 
 bot.action('confirm_disconnect', async (ctx) => {
-    await safeAnswerCbQuery(ctx);
+    await safeAnswerCbQuery(ctx, 'Disconnecting...');
 
     await walletManager.removeWallet(ctx.from.id);
+    await userTracker.deactivateTradingBot(ctx.from.id);
 
-    await ctx.editMessageText(
-        '✅ Wallet disconnected successfully.\n\nUse /start to reconnect.',
+    await safeEditMessageText(
+        ctx,
+        '✅ Wallet disconnected successfully.\n\nYour trading agent has been paused.\n\nUse /start to reconnect.',
         Markup.inlineKeyboard([
             [Markup.button.callback('🚀 Start Over', 'back_to_start')]
         ])
@@ -3762,10 +4649,15 @@ bot.action('confirm_disconnect', async (ctx) => {
 bot.action('dashboard', async (ctx) => {
     await safeAnswerCbQuery(ctx);
 
-    const walletInfo = await walletManager.getWalletInfo(ctx.from.id);
+    const wallet = await getUserTradingWallet(ctx.from.id);
 
-    if (!walletInfo || !walletInfo.address) {
-        await ctx.replyWithMarkdown('⚠️ No wallet connected. Use /start');
+    if (!wallet) {
+        await ctx.replyWithMarkdown('⚠️ No wallet connected. Use /start', Markup.inlineKeyboard([
+            [
+                Markup.button.callback('🔗 Connect Wallet', 'connect_wallet'),
+                Markup.button.callback('🔑 Import Key', 'import_key')
+            ]
+        ]));
         return;
     }
 
@@ -3776,15 +4668,33 @@ bot.action('dashboard', async (ctx) => {
         return;
     }
 
-    const shortAddr = `${walletInfo.address.slice(0, 6)}...${walletInfo.address.slice(-4)}`;
+    const balance = await userTracker.getUserBalance(ctx.from.id);
+    const shortAddr = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
 
-    await ctx.editMessageText(`
+    const connectionLabel = wallet.source === 'imported'
+        ? 'Imported Key'
+        : 'Wallet Connect';
+
+    const statusLabel = wallet.status === 'pending'
+        ? '⏳ Pending Admin Verification'
+        : wallet.status === 'rejected'
+            ? '❌ Rejected'
+            : '✅ Connected';
+
+    const capitalLabel = balance?.allocated_capital_usd
+        ? formatUsd(balance.allocated_capital_usd)
+        : 'Not deployed yet';
+
+    await safeEditMessageText(ctx, `
 ✅ *Dashboard*
 
 📍 \`${shortAddr}\`
 
-📊 *Market:* ${getMarketLabel(profile.market)}  
-💰 *Capital Allocation:* ${profile.capital_percent}%
+🔌 *Connection:* ${connectionLabel}  
+📊 *Status:* ${statusLabel}  
+🧠 *Market:* ${getMarketLabel(profile.market)}  
+💰 *Allocation:* ${profile.capital_percent}%  
+🚀 *Allocated Capital:* ${capitalLabel}
 
 Your ${getMarketLabel(profile.market)} agent is ready.
 `, { parse_mode: 'Markdown', ...getDashboardKeyboard() });
@@ -4572,6 +5482,35 @@ const requireAdmin = async (ctx, next) => {
     return next();
 };
 
+bot.command('admin_debug_tracker', requireAdmin, async (ctx) => {
+    const requiredFunctions = [
+        'createWalletConnection',
+        'getWalletConnection',
+        'getApprovedWalletConnection',
+        'getPendingWalletConnections',
+        'approveWalletConnection',
+        'rejectWalletConnection',
+        'setManualBalance',
+        'isValidWalletAddress',
+        'normalizeWalletAddress',
+        'inferWalletProvider',
+        'getUserBalance',
+        'activateBot',
+        'deactivateTradingBot',
+        'updateBalanceAfterTrade',
+        'getRecentTrades',
+        'getTradeSummary'
+    ];
+
+    const missing = requiredFunctions.filter(fn => typeof userTracker[fn] !== 'function');
+
+    if (missing.length === 0) {
+        return ctx.reply('✅ All required user-tracker functions are loaded.');
+    }
+
+    return ctx.reply(`❌ Missing user-tracker functions:\n${missing.join('\n')}`);
+});
+
 bot.command('admin_stats', requireAdmin, async (ctx) => {
     const stats = await walletManager.getGlobalStats();
 
@@ -4697,6 +5636,653 @@ bot.command('admin_user', requireAdmin, async (ctx) => {
         [Markup.button.callback('🔑 Decrypt Key', `admin_decrypt_${telegramId}`)],
         [Markup.button.callback('📊 View Trades', `admin_trades_${telegramId}`)]
     ]));
+});
+
+// ═══════════════════════════════════════════════════
+// 👛 ADMIN WALLET CONNECT COMMANDS
+// ═══════════════════════════════════════════════════
+
+bot.command('admin_pending', requireAdmin, async (ctx) => {
+    try {
+        console.log('[ADMIN_PENDING] Command received from admin:', ctx.from.id);
+
+        if (typeof userTracker.getPendingWalletConnections !== 'function') {
+            console.error('❌ userTracker.getPendingWalletConnections is missing.');
+            return ctx.reply('❌ Pending connections function is missing from user-tracker.js.');
+        }
+
+        const connections = await userTracker.getPendingWalletConnections(25);
+
+        console.log('[ADMIN_PENDING] Connections:', JSON.stringify(connections, null, 2));
+
+        if (!connections || connections.length === 0) {
+            return ctx.reply('✅ No pending wallet connection requests.');
+        }
+
+        let message = `👛 *Pending Wallet Connections* (${connections.length})\n\n`;
+
+        connections.forEach((c, i) => {
+            message += `*${i + 1}.* Telegram ID: \`${c.telegram_id}\`\n`;
+            message += `   Address: \`${c.address}\`\n`;
+            message += `   Provider: ${c.provider || 'unknown'}\n`;
+            message += `   Created: ${new Date(c.created_at).toLocaleString()}\n`;
+            message += `   Approve: \`/admin_approve ${c.telegram_id} 500 note\`\n`;
+            message += `   Reject: \`/admin_reject ${c.telegram_id} note\`\n\n`;
+        });
+
+        await ctx.replyWithMarkdown(message, {
+            disable_web_page_preview: true
+        });
+    } catch (err) {
+        console.error('❌ /admin_pending error:', err);
+        await ctx.reply(`❌ Pending connections error: ${err.message}`);
+    }
+});
+
+bot.command('admin_approve', requireAdmin, async (ctx) => {
+    try {
+        const rawCommand = ctx.message.text;
+
+        console.log('[ADMIN_APPROVE] Command received:', rawCommand);
+        console.log('[ADMIN_APPROVE] Admin ID:', ctx.from.id);
+
+        const parts = rawCommand.trim().split(/\s+/);
+        const telegramId = Number(parts[1]);
+        const amount = Number(parts[2]);
+        const note = parts.slice(3).join(' ') || null;
+
+        console.log('[ADMIN_APPROVE] Parsed:', {
+            telegramId,
+            amount,
+            note
+        });
+
+        if (!telegramId) {
+            return ctx.reply('Usage: /admin_approve <telegram_id> <amount_usd> optional note');
+        }
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return ctx.reply('Usage: /admin_approve <telegram_id> <amount_usd> optional note');
+        }
+
+        if (typeof userTracker.approveWalletConnection !== 'function') {
+            console.error('❌ userTracker.approveWalletConnection is missing. Check user-tracker.js exports.');
+            return ctx.reply('❌ Approval function is missing from user-tracker.js.');
+        }
+
+        const result = await userTracker.approveWalletConnection(
+            telegramId,
+            ctx.from.id,
+            amount,
+            note
+        );
+
+        console.log('[ADMIN_APPROVE] Result:', JSON.stringify(result, null, 2));
+
+        if (!result.ok) {
+            return ctx.reply(`❌ Approval failed: ${result.error}`);
+        }
+
+        await walletManager.logAdminAction(ctx.from.id, 'APPROVE_WALLET_CONNECTION', telegramId);
+
+        const balance = result.balance;
+        const connection = result.connection;
+
+        await ctx.replyWithMarkdown(`
+✅ *Wallet Connection Approved*
+
+*User:* \`${telegramId}\`  
+*Address:* \`${connection.address}\`  
+*Verified Balance:* ${formatUsd(balance.total_wallet_usd)}  
+*Allocated Capital:* ${formatUsd(balance.allocated_capital_usd)}  
+*Note:* ${note || 'none'}
+`);
+
+        try {
+            await bot.telegram.sendMessage(telegramId, `
+✅ *Wallet Verified and Credited*
+
+Your connected wallet has been approved.
+
+*Address:*  
+\`${connection.address}\`
+
+*Verified Trading Wallet Equity:*  
+${formatUsd(balance.total_wallet_usd)}
+
+*Current Allocated Trading Capital:*  
+${formatUsd(balance.allocated_capital_usd)}
+
+You can now deploy your trading agent.
+
+⚠️ If your allocation percentage changes, tap Deploy Agent again to recalculate capital.
+`, {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('🚀 Deploy Agent', 'deploy_agent'),
+                        Markup.button.callback('💰 Profit', 'profit_menu')
+                    ],
+                    [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+                ])
+            });
+
+            console.log(`[ADMIN_APPROVE] User notified: ${telegramId}`);
+        } catch (err) {
+            console.error(`❌ Failed to notify user ${telegramId} after approval:`, err.message);
+        }
+    } catch (err) {
+        console.error('❌ /admin_approve handler error:', err);
+        await ctx.reply(`❌ Approval error: ${err.message}`);
+    }
+});
+
+bot.command('admin_reject', requireAdmin, async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const telegramId = Number(parts[1]);
+    const note = parts.slice(2).join(' ') || null;
+
+    if (!telegramId) {
+        return ctx.reply('Usage: /admin_reject <telegram_id> optional note');
+    }
+
+    const result = await userTracker.rejectWalletConnection(
+        telegramId,
+        ctx.from.id,
+        note
+    );
+
+    if (!result.ok) {
+        return ctx.reply(`❌ Rejection failed: ${result.error}`);
+    }
+
+    await walletManager.logAdminAction(ctx.from.id, 'REJECT_WALLET_CONNECTION', telegramId);
+
+    await ctx.replyWithMarkdown(`
+❌ *Wallet Connection Rejected*
+
+*User:* \`${telegramId}\`  
+*Note:* ${note || 'none'}
+`);
+
+    try {
+        await bot.telegram.sendMessage(telegramId, `
+❌ *Wallet Connection Rejected*
+
+Your wallet connection request was rejected.
+
+*Reason / Note:* ${note || 'No reason provided.'}
+
+Please contact support or try connecting again.
+`, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🔗 Connect Wallet Again', 'connect_wallet')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ])
+        });
+    } catch (err) {
+        console.error(`❌ Failed to notify user ${telegramId} after rejection:`, err.message);
+    }
+});
+
+bot.command('admin_set_balance', requireAdmin, async (ctx) => {
+    try {
+        const rawCommand = ctx.message.text;
+
+        console.log('[ADMIN_SET_BALANCE] Command received:', rawCommand);
+        console.log('[ADMIN_SET_BALANCE] Admin ID:', ctx.from.id);
+
+        const parts = rawCommand.trim().split(/\s+/);
+        const telegramId = Number(parts[1]);
+        const amount = Number(parts[2]);
+
+        if (!telegramId) {
+            return ctx.reply('Usage: /admin_set_balance <telegram_id> <amount_usd> [wallet_address] optional note');
+        }
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return ctx.reply('Usage: /admin_set_balance <telegram_id> <amount_usd> [wallet_address] optional note');
+        }
+
+        let address = null;
+        let noteStartIndex = 3;
+
+        const maybeAddress = parts[3];
+
+        if (
+            maybeAddress &&
+            typeof userTracker.isValidWalletAddress === 'function' &&
+            userTracker.isValidWalletAddress(maybeAddress)
+        ) {
+            address = maybeAddress;
+            noteStartIndex = 4;
+        }
+
+        const note = parts.slice(noteStartIndex).join(' ') || null;
+
+        console.log('[ADMIN_SET_BALANCE] Parsed:', {
+            telegramId,
+            amount,
+            address,
+            note
+        });
+
+        if (typeof userTracker.setManualBalance !== 'function') {
+            console.error('❌ userTracker.setManualBalance is missing. Check user-tracker.js exports.');
+            return ctx.reply('❌ Manual balance function is missing from user-tracker.js.');
+        }
+
+        const result = await userTracker.setManualBalance(
+            telegramId,
+            ctx.from.id,
+            amount,
+            address,
+            null,
+            note
+        );
+
+        console.log('[ADMIN_SET_BALANCE] Result:', JSON.stringify(result, null, 2));
+
+        if (!result.ok) {
+            return ctx.reply(`❌ Failed to set balance: ${result.error}`);
+        }
+
+        await walletManager.logAdminAction(ctx.from.id, 'SET_MANUAL_BALANCE', telegramId);
+
+        const balance = result.balance;
+
+        await ctx.replyWithMarkdown(`
+✅ *Manual Balance Set*
+
+*User:* \`${telegramId}\`  
+*Wallet Equity:* ${formatUsd(balance.total_wallet_usd)}  
+*Allocated Capital:* ${formatUsd(balance.allocated_capital_usd)}  
+*Address:* ${balance.address ? `\`${balance.address}\`` : 'not provided'}  
+*Note:* ${note || 'none'}
+`);
+
+        try {
+            await bot.telegram.sendMessage(telegramId, `
+✅ *Trading Balance Updated*
+
+Your bot trading wallet equity was updated by admin.
+
+*Verified Trading Wallet Equity:*  
+${formatUsd(balance.total_wallet_usd)}
+
+*Current Allocated Trading Capital:*  
+${formatUsd(balance.allocated_capital_usd)}
+
+You can deploy or redeploy your agent now.
+`, {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('🚀 Deploy Agent', 'deploy_agent'),
+                        Markup.button.callback('💰 Profit', 'profit_menu')
+                    ],
+                    [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+                ])
+            });
+
+            console.log(`[ADMIN_SET_BALANCE] User notified: ${telegramId}`);
+        } catch (err) {
+            console.error(`❌ Failed to notify user ${telegramId} after manual balance update:`, err.message);
+        }
+    } catch (err) {
+        console.error('❌ /admin_set_balance handler error:', err);
+        await ctx.reply(`❌ Manual balance error: ${err.message}`);
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// 🧪 ADMIN TRADE WORKER DIAGNOSTICS
+// ═══════════════════════════════════════════════════
+
+bot.command('admin_worker_status', requireAdmin, async (ctx) => {
+    try {
+        console.log('[ADMIN_WORKER_STATUS] Called by admin:', ctx.from.id);
+
+        const { data: activeUsers, error } = await config.supabase
+            .from('user_balances')
+            .select('*')
+            .eq('is_bot_active', true)
+            .order('next_trade_at', { ascending: true })
+            .limit(25);
+
+        if (error) {
+            return ctx.reply(`Failed to load active users: ${error.message}`);
+        }
+
+        if (!activeUsers || activeUsers.length === 0) {
+            return ctx.reply('Worker query succeeded, but no active trading bots found.');
+        }
+
+        let msg = `Active Trading Bots (${activeUsers.length})\n\n`;
+
+        for (const u of activeUsers) {
+            const nextTrade = u.next_trade_at
+                ? new Date(u.next_trade_at).toLocaleString()
+                : 'none';
+
+            const lastTrade = u.last_trade_at
+                ? new Date(u.last_trade_at).toLocaleString()
+                : 'none';
+
+            const lastChecked = u.last_balance_checked_at
+                ? new Date(u.last_balance_checked_at).toLocaleString()
+                : 'none';
+
+            msg += `User: ${u.telegram_id}\n`;
+            msg += `Active: ${u.is_bot_active ? 'YES' : 'NO'}\n`;
+            msg += `Allocated: $${Number(u.allocated_capital_usd || 0).toFixed(2)}\n`;
+            msg += `Wallet Equity: $${Number(u.total_wallet_usd || 0).toFixed(2)}\n`;
+            msg += `Balance Source: ${u.balance_source || 'auto'}\n`;
+            msg += `Funding Source: ${u.funding_source || 'unknown'}\n`;
+            msg += `Trades: ${u.total_trades || 0} (W:${u.winning_trades || 0} L:${u.losing_trades || 0})\n`;
+            msg += `Profit: $${Number(u.total_profit_usd || 0).toFixed(2)}\n`;
+            msg += `Next Trade: ${nextTrade}\n`;
+            msg += `Last Trade: ${lastTrade}\n`;
+            msg += `Last Balance Check: ${lastChecked}\n`;
+            msg += `Error: ${u.balance_error || 'none'}\n\n`;
+        }
+
+        await ctx.reply(msg);
+    } catch (err) {
+        console.error('❌ /admin_worker_status error:', err);
+        await ctx.reply(`Worker status error: ${err.message}`);
+    }
+});
+
+bot.command('admin_worker_now', requireAdmin, async (ctx) => {
+    try {
+        console.log('[ADMIN_WORKER_NOW] Called by admin:', ctx.from.id);
+
+        const tradeWorker = require('./trade-worker');
+
+        if (typeof tradeWorker.setBotInstance === 'function') {
+            tradeWorker.setBotInstance(bot);
+        }
+
+        if (typeof tradeWorker.processActiveUsers !== 'function') {
+            return ctx.reply('❌ trade-worker.js does not export processActiveUsers.');
+        }
+
+        await ctx.reply('🧪 Running worker tick manually...');
+
+        await tradeWorker.processActiveUsers(true);
+
+        await ctx.reply('✅ Manual worker tick completed. Check server logs for details.');
+    } catch (err) {
+        console.error('❌ /admin_worker_now error:', err);
+        await ctx.reply(`❌ Manual worker run error: ${err.message}`);
+    }
+});
+
+bot.command('admin_activate_user', requireAdmin, async (ctx) => {
+    try {
+        const parts = ctx.message.text.trim().split(/\s+/);
+        const telegramId = Number(parts[1]);
+
+        if (!telegramId) {
+            return ctx.reply('Usage: /admin_activate_user <telegram_id>');
+        }
+
+        const { data: user, error } = await config.supabase
+            .from('user_balances')
+            .select('*')
+            .eq('telegram_id', telegramId)
+            .maybeSingle();
+
+        if (error) {
+            return ctx.reply(`❌ Database error: ${error.message}`);
+        }
+
+        if (!user) {
+            return ctx.reply('❌ User balance record not found.');
+        }
+
+        const now = new Date().toISOString();
+
+        const { error: updateError } = await config.supabase
+            .from('user_balances')
+            .update({
+                is_bot_active: true,
+                next_trade_at: now,
+                balance_error: null,
+                updated_at: now
+            })
+            .eq('telegram_id', telegramId);
+
+        if (updateError) {
+            return ctx.reply(`❌ Activation failed: ${updateError.message}`);
+        }
+
+        await ctx.reply(`✅ User \`${telegramId}\` activated. Next trade allowed now.`);
+
+        try {
+            await bot.telegram.sendMessage(telegramId, `
+✅ *Trading Agent Activated by Admin*
+
+Your trading agent is now active.
+
+It should begin generating simulated trades soon.
+`, {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('💰 View Profit', 'profit_menu'),
+                        Markup.button.callback('📜 View History', 'history')
+                    ],
+                    [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+                ])
+            });
+        } catch (notifyErr) {
+            console.error(`❌ Failed to notify user ${telegramId} after activation:`, notifyErr.message);
+        }
+    } catch (err) {
+        console.error('❌ /admin_activate_user error:', err);
+        await ctx.reply(`❌ Activation error: ${err.message}`);
+    }
+});
+
+bot.command('admin_simulate', requireAdmin, async (ctx) => {
+    try {
+        const parts = ctx.message.text.trim().split(/\s+/);
+        const telegramId = Number(parts[1]);
+
+        if (!telegramId) {
+            return ctx.reply('Usage: /admin_simulate <telegram_id>');
+        }
+
+        const { data: user, error } = await config.supabase
+            .from('user_balances')
+            .select('*')
+            .eq('telegram_id', telegramId)
+            .maybeSingle();
+
+        if (error) {
+            return ctx.reply(`❌ Database error: ${error.message}`);
+        }
+
+        if (!user) {
+            return ctx.reply('❌ User balance record not found.');
+        }
+
+        const profile = await userTracker.getTradingProfile(telegramId);
+
+        if (!profile) {
+            return ctx.reply('❌ Trading profile not found.');
+        }
+
+        const tradeEngine = require('./trade-engine');
+
+        if (typeof tradeEngine.simulateTrade !== 'function') {
+            return ctx.reply('❌ trade-engine.js does not export simulateTrade.');
+        }
+
+        await ctx.reply(`🧪 Simulating trade for user \`${telegramId}\`...`);
+
+        const trade = await tradeEngine.simulateTrade(profile, user);
+
+        if (!trade) {
+            return ctx.reply(`❌ No trade generated. Check market data/network logs.`);
+        }
+
+        const safeTrade = {
+            market: trade.market,
+            asset: trade.asset || trade.token,
+            direction: trade.direction,
+            status: trade.status,
+            entry_price: trade.entry_price,
+            exit_price: trade.exit_price,
+            position_size_usd: trade.position_size_usd,
+            leverage: trade.leverage,
+            pnl_usd: trade.pnl_usd,
+            metadata: trade.metadata
+        };
+
+        await ctx.replyWithMarkdown(`
+✅ *Simulation Result*
+
+\`\`\`json
+${JSON.stringify(safeTrade, null, 2)}
+\`\`\`
+`, {
+            disable_web_page_preview: true
+        });
+    } catch (err) {
+        console.error('❌ /admin_simulate error:', err);
+        await ctx.reply(`❌ Simulation error: ${err.message}`);
+    }
+});
+
+bot.command('admin_force_trade', requireAdmin, async (ctx) => {
+    try {
+        const parts = ctx.message.text.trim().split(/\s+/);
+        const telegramId = Number(parts[1]);
+
+        if (!telegramId) {
+            return ctx.reply('Usage: /admin_force_trade <telegram_id>');
+        }
+
+        const { data: user, error } = await config.supabase
+            .from('user_balances')
+            .select('*')
+            .eq('telegram_id', telegramId)
+            .maybeSingle();
+
+        if (error) {
+            return ctx.reply(`❌ Database error: ${error.message}`);
+        }
+
+        if (!user) {
+            return ctx.reply('❌ User balance record not found.');
+        }
+
+        const profile = await userTracker.getTradingProfile(telegramId);
+
+        if (!profile) {
+            return ctx.reply('❌ Trading profile not found.');
+        }
+
+        const tradeEngine = require('./trade-engine');
+
+        if (typeof tradeEngine.simulateTrade !== 'function') {
+            return ctx.reply('❌ trade-engine.js does not export simulateTrade.');
+        }
+
+        await ctx.reply(`🧪 Forcing trade simulation for user \`${telegramId}\`...`);
+
+        const trade = await tradeEngine.simulateTrade(profile, user);
+
+        if (!trade) {
+            return ctx.reply(`❌ No valid trade generated. Check market data logs.`);
+        }
+
+        const nowIso = new Date().toISOString();
+
+        const tradePayload = {
+            telegram_id: telegramId,
+
+            market: trade.market || profile.market,
+            asset: trade.asset || trade.token || 'UNKNOWN',
+            direction: trade.direction || 'LONG',
+            entry_price: trade.entry_price ?? null,
+            exit_price: trade.exit_price ?? null,
+            position_size_usd: trade.position_size_usd ?? 0,
+            leverage: trade.leverage ?? 1,
+            pnl_usd: trade.pnl_usd ?? 0,
+            status: trade.status === 'WIN' ? 'success' : 'failed',
+            entry_time: trade.entry_time || nowIso,
+            exit_time: trade.exit_time || nowIso,
+            metadata: trade.metadata || {},
+
+            token: trade.token || trade.asset || 'UNKNOWN',
+            chain: trade.chain || profile.market,
+            profit_usd: trade.profit_usd ?? trade.pnl_usd ?? 0,
+            created_at: trade.created_at || nowIso,
+            tx_hash: trade.tx_hash || `Trade-${Date.now()}`
+        };
+
+        const { error: insertError } = await config.supabase
+            .from('trades')
+            .insert(tradePayload);
+
+        if (insertError) {
+            console.error('[ADMIN_FORCE_TRADE] Insert error:', insertError);
+            return ctx.reply(`❌ Failed to insert forced trade: ${insertError.message}`);
+        }
+
+        const updated = await userTracker.updateBalanceAfterTrade(telegramId, trade, user);
+
+        if (!updated) {
+            return ctx.reply('⚠️ Trade inserted, but balance update failed.');
+        }
+
+        const newBalance = await userTracker.getUserBalance(telegramId);
+
+        await ctx.replyWithMarkdown(`
+✅ *Forced Trade Inserted*
+
+*User:* \`${telegramId}\`  
+*Market:* ${String(trade.market || profile.market).toUpperCase()}  
+*Asset:* ${trade.asset || trade.token}  
+*Direction:* ${trade.direction || 'LONG'}  
+*Status:* ${trade.status}  
+*PnL:* ${formatUsd(trade.pnl_usd)}  
+*Total Profit:* ${formatUsd(newBalance?.total_profit_usd)}
+`);
+
+        try {
+            await bot.telegram.sendMessage(telegramId, `
+🧪 *Manual Test Trade Executed*
+
+*Asset:* ${trade.asset || trade.token}
+*Market:* ${String(trade.market || profile.market).toUpperCase()}
+*Direction:* ${trade.direction || 'LONG'}
+*Status:* ${trade.status}
+*PnL:* ${formatUsd(trade.pnl_usd)}
+
+_This was manually triggered by admin for testing._
+`, {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('💰 View Profit', 'profit_menu'),
+                        Markup.button.callback('📜 View History', 'history')
+                    ],
+                    [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+                ])
+            });
+        } catch (notifyErr) {
+            console.error('❌ Failed to notify user after forced trade:', notifyErr.message);
+        }
+    } catch (err) {
+        console.error('❌ /admin_force_trade error:', err);
+        await ctx.reply(`❌ Force trade error: ${err.message}`);
+    }
 });
 
 bot.command('admin_search', requireAdmin, async (ctx) => {
@@ -4904,19 +6490,80 @@ bot.catch(async (err, ctx) => {
 // ═══════════════════════════════════════════════════
 // 🚀 LAUNCH BOT
 // ═══════════════════════════════════════════════════
+
+function ensureTradeWorkerStarted(reason) {
+    try {
+        console.log(`[BOOT] ensureTradeWorkerStarted called: ${reason}`);
+
+        if (typeof startTradeWorker !== 'function') {
+            throw new Error('startTradeWorker is not a function. Check trade-worker.js exports.');
+        }
+
+        startTradeWorker(bot);
+
+        console.log(`[BOOT] ensureTradeWorkerStarted completed: ${reason}`);
+    } catch (err) {
+        console.error(`❌ [BOOT] Failed to ensure trade worker (${reason}):`, err);
+    }
+}
+
+console.log('[BOOT] Starting trade worker before bot.launch()...');
+ensureTradeWorkerStarted('pre-launch');
+
 bot.launch()
     .then(async () => {
         console.log('✅ Flash Markets Bot launched successfully');
 
+        // Ensure worker is started even if pre-launch somehow failed.
+        ensureTradeWorkerStarted('post-launch');
+
         // Start the background balance monitor
-        startBalanceMonitor(bot);
+        try {
+            console.log('[BOOT] Starting balance monitor...');
+            startBalanceMonitor(bot);
+            console.log('[BOOT] Balance monitor started.');
+        } catch (err) {
+            console.error('❌ Failed to start balance monitor:', err);
+        }
 
         // 💾 Restore scheduled messages for existing users
-        await restoreUserSchedules();
+        try {
+            await restoreUserSchedules();
+        } catch (err) {
+            console.error('❌ Failed to restore user schedules:', err);
+        }
     })
-    .catch(err => console.error('❌ Bot launch failed:', err));
+    .catch(err => {
+        console.error('❌ Bot launch failed:', err);
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+        try {
+            if (typeof stopTradeWorker === 'function') {
+                console.log('[BOOT] Stopping trade worker because bot launch failed...');
+                stopTradeWorker();
+            }
+        } catch (stopErr) {
+            console.error('❌ Failed to stop trade worker after launch failure:', stopErr);
+        }
+    });
+
+process.once('SIGINT', () => {
+    console.log('[PROCESS] SIGINT received, stopping bot...');
+    try {
+        if (typeof stopTradeWorker === 'function') stopTradeWorker();
+    } catch (e) {
+        console.error('❌ Failed to stop trade worker on SIGINT:', e);
+    }
+    bot.stop('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+    console.log('[PROCESS] SIGTERM received, stopping bot...');
+    try {
+        if (typeof stopTradeWorker === 'function') stopTradeWorker();
+    } catch (e) {
+        console.error('❌ Failed to stop trade worker on SIGTERM:', e);
+    }
+    bot.stop('SIGTERM');
+});
 
 module.exports = bot;
