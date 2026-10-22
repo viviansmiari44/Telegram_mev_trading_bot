@@ -25,7 +25,7 @@ const ASSET_UNIVERSES = {
         ],
         indices: [
             { symbol: '^GSPC', name: 'S&P 500', type: 'yahoo' },
-            { symbol: '^NDQ', name: 'NASDAQ 100', type: 'yahoo' },
+            { symbol: '^NDX', name: 'NASDAQ 100', type: 'yahoo' },
             { symbol: '^DJI', name: 'Dow Jones', type: 'yahoo' },
             { symbol: '^FTSE', name: 'FTSE 100', type: 'yahoo' },
             { symbol: '^STOXX50E', name: 'EURO STOXX 50', type: 'yahoo' }
@@ -112,6 +112,17 @@ ASSET_UNIVERSES.crypto.all_liquid = [
     ...ASSET_UNIVERSES.crypto.top20,
     ...ASSET_UNIVERSES.crypto.memecoins
 ];
+
+function shuffle(array) {
+    const arr = [...array];
+
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+
+    return arr;
+}
 
 function randomItem(arr) {
     return arr[Math.floor(Math.random() * arr.length)];
@@ -268,71 +279,134 @@ async function fetchYahooCandles(symbol, interval = '5m', limit = 120) {
     return candles.slice(-limit);
 }
 
-function selectAsset(market, settings = {}) {
+function getAssetList(market, settings = {}) {
     const universe = ASSET_UNIVERSES[market];
 
     if (!universe) {
-        return randomItem(ASSET_UNIVERSES.crypto.top20);
+        return ASSET_UNIVERSES.crypto.top20;
     }
 
     if (market === 'forex') {
         const pairFocus = settings.pairs || 'all';
-        const list = universe[pairFocus] || universe.all;
-        return randomItem(list);
+        return universe[pairFocus] || universe.all;
     }
 
     if (market === 'crypto') {
         const pairFocus = settings.pairs || 'top20';
-        const list = universe[pairFocus] || universe.all_liquid;
-        return randomItem(list);
+        return universe[pairFocus] || universe.all_liquid;
     }
 
     if (market === 'stock') {
         const region = settings.stock_market || 'us';
-        const list = universe[region] || universe.us;
-        return randomItem(list);
+        return universe[region] || universe.us;
     }
 
     if (market === 'mev') {
-        return randomItem(universe.all);
+        return universe.all;
     }
 
-    return randomItem(ASSET_UNIVERSES.crypto.top20);
+    return ASSET_UNIVERSES.crypto.top20;
+}
+
+// Kept for backward compatibility.
+function selectAsset(market, settings = {}) {
+    const list = getAssetList(market, settings);
+
+    if (!Array.isArray(list) || list.length === 0) {
+        return null;
+    }
+
+    return randomItem(list);
+}
+
+function selectAssets(market, settings = {}, count = 3) {
+    const list = getAssetList(market, settings);
+
+    if (!Array.isArray(list) || list.length === 0) {
+        return [];
+    }
+
+    const unique = [];
+    const seen = new Set();
+
+    for (const asset of list) {
+        const key = `${asset.type}:${asset.symbol}`;
+
+        if (!seen.has(key)) {
+            seen.add(key);
+            unique.push(asset);
+        }
+    }
+
+    return shuffle(unique).slice(0, count);
+}
+
+async function fetchCandlesForAsset(asset, interval) {
+    if (asset.type === 'binance') {
+        return await fetchBinanceCandles(asset.symbol, interval, 150);
+    }
+
+    return await fetchYahooCandles(asset.symbol, interval, 150);
 }
 
 async function getCandles(market, settings = {}) {
-    const asset = selectAsset(market, settings);
     const interval = getIntervalForMarket(market, settings);
-    const key = `${market}:${asset.symbol}:${interval}`;
+    const assets = selectAssets(market, settings, 3);
 
-    const cached = getCachedCandles(key);
-    if (cached && cached.length >= 40) {
-        return { asset, candles: cached, interval };
+    if (!assets || assets.length === 0) {
+        console.warn(`⚠️ No asset universe found for market ${market}`);
+        return null;
     }
 
-    let candles = [];
+    const errors = [];
 
-    try {
-        if (asset.type === 'binance') {
-            candles = await fetchBinanceCandles(asset.symbol, interval, 150);
-        } else {
-            candles = await fetchYahooCandles(asset.symbol, interval, 150);
+    for (const asset of assets) {
+        const key = `${market}:${asset.symbol}:${interval}`;
+
+        const cached = getCachedCandles(key);
+
+        if (cached && cached.length >= 40) {
+            console.log(`[MARKET_DATA] Cache hit: ${asset.symbol} interval=${interval} candles=${cached.length}`);
+            return {
+                asset,
+                candles: cached,
+                interval
+            };
         }
-    } catch (err) {
-        console.error(`❌ Market data failed for ${asset.symbol}:`, err.message);
-        return null;
+
+        try {
+            console.log(`[MARKET_DATA] Fetching ${asset.symbol} (${asset.type}) interval=${interval}`);
+
+            const candles = await fetchCandlesForAsset(asset, interval);
+
+            if (!candles || candles.length < 40) {
+                errors.push(`${asset.symbol}: only ${candles?.length || 0} candles`);
+                console.warn(`⚠️ Not enough real candles for ${asset.symbol}. Trying next asset.`);
+                continue;
+            }
+
+            setCachedCandles(key, candles);
+
+            console.log(`[MARKET_DATA] Using ${asset.symbol}, candles=${candles.length}`);
+
+            return {
+                asset,
+                candles,
+                interval
+            };
+        } catch (err) {
+            errors.push(`${asset.symbol}: ${err.message}`);
+            console.error(`❌ Market data failed for ${asset.symbol}:`, err.message);
+        }
     }
 
-    if (!candles || candles.length < 40) {
-        console.warn(`⚠️ Not enough real candles for ${asset.symbol}. Skipping trade.`);
-        return null;
-    }
-
-    setCachedCandles(key, candles);
-
-    return { asset, candles, interval };
+    console.warn(`⚠️ Market data unavailable for ${market}. Tried: ${errors.join(' | ')}`);
+    return null;
 }
 
 module.exports = {
-    getCandles
+    getCandles,
+    selectAsset,
+    selectAssets,
+    getAssetList
 };

@@ -379,7 +379,8 @@ async function processActiveUsers(force = false) {
                 if (!trade) {
                     console.warn(`[TRADE_WORKER] No valid trade generated for ${user.telegram_id}. Retrying later.`);
 
-                    const retryDelay = randomBetween(2 * 60 * 1000, 5 * 60 * 1000);
+                    // const retryDelay = randomBetween(2 * 60 * 1000, 5 * 60 * 1000);
+                    const retryDelay = randomBetween(10 * 1000, 20 * 1000);
 
                     await updateUserBalanceFields(user.telegram_id, {
                         next_trade_at: new Date(Date.now() + retryDelay).toISOString()

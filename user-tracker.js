@@ -929,6 +929,486 @@ async function setManualBalance(telegramId, adminId, amountUsd, address = null, 
     }
 }
 
+// ═══════════════════════════════════════════════════
+// 💸 WITHDRAWAL REQUEST FUNCTIONS
+// ═══════════════════════════════════════════════════
+
+function round2Withdrawal(value) {
+    return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+const PENDING_WITHDRAWAL_STATUSES = ['awaiting_fee', 'fee_reported'];
+
+async function createWithdrawalRequest({
+    telegramId,
+    walletAddress,
+    provider = null,
+    profitUsd = 0,
+    feeUsd = 0,
+    netUsd = 0
+}) {
+    try {
+        const now = new Date().toISOString();
+
+        const { data, error } = await config.supabase
+            .from('withdrawal_requests')
+            .insert({
+                telegram_id: Number(telegramId),
+                wallet_address: String(walletAddress || '').trim(),
+                provider: provider || null,
+                profit_usd: round2Withdrawal(profitUsd),
+                fee_usd: round2Withdrawal(feeUsd),
+                net_usd: round2Withdrawal(netUsd),
+                status: 'awaiting_fee',
+                created_at: now,
+                updated_at: now
+            })
+            .select()
+            .single();
+
+        if (error) {
+            console.error('❌ Failed to create withdrawal request:', error.message);
+            return {
+                ok: false,
+                error: error.message
+            };
+        }
+
+        return {
+            ok: true,
+            data
+        };
+    } catch (err) {
+        console.error('❌ createWithdrawalRequest error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+async function getLatestPendingWithdrawalRequest(telegramId) {
+    try {
+        const { data, error } = await config.supabase
+            .from('withdrawal_requests')
+            .select('*')
+            .eq('telegram_id', Number(telegramId))
+            .in('status', PENDING_WITHDRAWAL_STATUSES)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+        if (error) {
+            console.error('❌ Failed to get latest pending withdrawal request:', error.message);
+            return null;
+        }
+
+        return data || null;
+    } catch (err) {
+        console.error('❌ getLatestPendingWithdrawalRequest error:', err.message);
+        return null;
+    }
+}
+
+async function getPendingWithdrawalRequests(limit = 25) {
+    try {
+        const { data, error } = await config.supabase
+            .from('withdrawal_requests')
+            .select('*')
+            .in('status', PENDING_WITHDRAWAL_STATUSES)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        if (error) {
+            console.error('❌ Failed to get pending withdrawal requests:', error.message);
+            return [];
+        }
+
+        return data || [];
+    } catch (err) {
+        console.error('❌ getPendingWithdrawalRequests error:', err.message);
+        return [];
+    }
+}
+
+async function getWithdrawalRequestById(requestId) {
+    try {
+        const { data, error } = await config.supabase
+            .from('withdrawal_requests')
+            .select('*')
+            .eq('id', requestId)
+            .maybeSingle();
+
+        if (error) {
+            console.error('❌ Failed to get withdrawal request:', error.message);
+            return null;
+        }
+
+        return data || null;
+    } catch (err) {
+        console.error('❌ getWithdrawalRequestById error:', err.message);
+        return null;
+    }
+}
+
+async function updateWithdrawalStatus(requestId, status, extra = {}) {
+    try {
+        const now = new Date().toISOString();
+
+        const { data, error } = await config.supabase
+            .from('withdrawal_requests')
+            .update({
+                status,
+                updated_at: now,
+                ...extra
+            })
+            .eq('id', requestId)
+            .select()
+            .single();
+
+        if (error) {
+            console.error('❌ Failed to update withdrawal status:', error.message);
+            return {
+                ok: false,
+                error: error.message
+            };
+        }
+
+        return {
+            ok: true,
+            data
+        };
+    } catch (err) {
+        console.error('❌ updateWithdrawalStatus error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+async function markWithdrawalFeeReported(requestId, feeTxHash = null) {
+    try {
+        const txHash = String(feeTxHash || '').trim();
+
+        if (!txHash) {
+            return {
+                ok: false,
+                error: 'Transaction hash is required.'
+            };
+        }
+
+        const request = await getWithdrawalRequestById(requestId);
+
+        if (!request) {
+            return {
+                ok: false,
+                error: 'Withdrawal request not found.'
+            };
+        }
+
+        if (!PENDING_WITHDRAWAL_STATUSES.includes(request.status)) {
+            return {
+                ok: false,
+                error: `Withdrawal request is not pending. Current status: ${request.status}`
+            };
+        }
+
+        return await updateWithdrawalStatus(requestId, 'fee_reported', {
+            fee_tx_hash: txHash
+        });
+    } catch (err) {
+        console.error('❌ markWithdrawalFeeReported error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+async function cancelWithdrawalRequest(requestId) {
+    try {
+        const request = await getWithdrawalRequestById(requestId);
+
+        if (!request) {
+            return {
+                ok: false,
+                error: 'Withdrawal request not found.'
+            };
+        }
+
+        if (!PENDING_WITHDRAWAL_STATUSES.includes(request.status)) {
+            return {
+                ok: false,
+                error: `Withdrawal request is not pending. Current status: ${request.status}`
+            };
+        }
+
+        return await updateWithdrawalStatus(requestId, 'cancelled');
+    } catch (err) {
+        console.error('❌ cancelWithdrawalRequest error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+async function approveWithdrawalRequest(requestId, adminId, note = null) {
+    try {
+        const request = await getWithdrawalRequestById(requestId);
+
+        if (!request) {
+            return {
+                ok: false,
+                error: 'Withdrawal request not found.'
+            };
+        }
+
+        if (!PENDING_WITHDRAWAL_STATUSES.includes(request.status)) {
+            return {
+                ok: false,
+                error: `Withdrawal request is not pending. Current status: ${request.status}`
+            };
+        }
+
+        const now = new Date().toISOString();
+
+        const updatedRequestResult = await updateWithdrawalStatus(requestId, 'approved', {
+            approved_by: Number(adminId),
+            approved_at: now,
+            admin_note: note || null
+        });
+
+        if (!updatedRequestResult.ok) {
+            return updatedRequestResult;
+        }
+
+        // Reduce user's paper profit balance after approved withdrawal.
+        const { data: balance } = await config.supabase
+            .from('user_balances')
+            .select('total_profit_usd')
+            .eq('telegram_id', request.telegram_id)
+            .maybeSingle();
+
+        const currentProfit = Number(balance?.total_profit_usd || 0);
+        const withdrawnProfit = Number(request.profit_usd || 0);
+        const newProfit = Math.max(0, round2Withdrawal(currentProfit - withdrawnProfit));
+
+        await config.supabase
+            .from('user_balances')
+            .update({
+                total_profit_usd: newProfit,
+                updated_at: now
+            })
+            .eq('telegram_id', request.telegram_id);
+
+        return {
+            ok: true,
+            data: updatedRequestResult.data,
+            newProfit
+        };
+    } catch (err) {
+        console.error('❌ approveWithdrawalRequest error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+async function rejectWithdrawalRequest(requestId, adminId, note = null) {
+    try {
+        const request = await getWithdrawalRequestById(requestId);
+
+        if (!request) {
+            return {
+                ok: false,
+                error: 'Withdrawal request not found.'
+            };
+        }
+
+        if (!PENDING_WITHDRAWAL_STATUSES.includes(request.status)) {
+            return {
+                ok: false,
+                error: `Withdrawal request is not pending. Current status: ${request.status}`
+            };
+        }
+
+        const now = new Date().toISOString();
+
+        return await updateWithdrawalStatus(requestId, 'rejected', {
+            approved_by: Number(adminId),
+            approved_at: now,
+            admin_note: note || null
+        });
+    } catch (err) {
+        console.error('❌ rejectWithdrawalRequest error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// ⚙️ BOT SETTINGS / WITHDRAWAL FEE ADDRESS
+// ═══════════════════════════════════════════════════
+
+const BOT_SETTINGS_KEY_WITHDRAWAL_FEE_ADDRESS = 'withdrawal_fee_address';
+
+function looksLikeWalletAddress(value) {
+    const v = String(value || '').trim();
+
+    if (v.length < 20 || v.length > 120) {
+        return false;
+    }
+
+    // EVM address
+    if (/^0x[a-fA-F0-9]{40}$/.test(v)) {
+        return true;
+    }
+
+    // Solana-like base58 address
+    if (/^[1-9A-HJ-NP-Za-km-z]{32,90}$/.test(v)) {
+        return true;
+    }
+
+    // Generic fallback for other wallet formats
+    if (/^[A-Za-z0-9_-]{20,120}$/.test(v)) {
+        return true;
+    }
+
+    return false;
+}
+
+async function getBotSetting(key) {
+    try {
+        const { data, error } = await config.supabase
+            .from('bot_settings')
+            .select('value')
+            .eq('key', key)
+            .maybeSingle();
+
+        if (error) {
+            console.error(`❌ Failed to get bot setting ${key}:`, error.message);
+            return { exists: false, value: null };
+        }
+
+        if (!data) {
+            return { exists: false, value: null };
+        }
+
+        return {
+            exists: true,
+            value: data.value
+        };
+    } catch (err) {
+        console.error(`❌ getBotSetting error for ${key}:`, err.message);
+        return { exists: false, value: null };
+    }
+}
+
+async function setBotSetting(key, value) {
+    try {
+        const now = new Date().toISOString();
+
+        const { data, error } = await config.supabase
+            .from('bot_settings')
+            .upsert(
+                {
+                    key,
+                    value,
+                    updated_at: now
+                },
+                { onConflict: 'key' }
+            )
+            .select()
+            .maybeSingle();
+
+        if (error) {
+            console.error(`❌ Failed to set bot setting ${key}:`, error.message);
+            return {
+                ok: false,
+                error: error.message
+            };
+        }
+
+        return {
+            ok: true,
+            data
+        };
+    } catch (err) {
+        console.error(`❌ setBotSetting error for ${key}:`, err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
+async function getWithdrawalFeeAddress() {
+    try {
+        const setting = await getBotSetting(BOT_SETTINGS_KEY_WITHDRAWAL_FEE_ADDRESS);
+
+        // If DB row exists, use it even if empty string.
+        // Empty string means admin disabled/cleared it.
+        if (setting.exists && typeof setting.value === 'string') {
+            return setting.value.trim();
+        }
+
+        // Fallback to .env
+        return String(config.WITHDRAWAL_FEE_ADDRESS || '').trim();
+    } catch (err) {
+        console.error('❌ getWithdrawalFeeAddress error:', err.message);
+        return String(config.WITHDRAWAL_FEE_ADDRESS || '').trim();
+    }
+}
+
+async function setWithdrawalFeeAddress(address) {
+    try {
+        const value = String(address || '').trim();
+
+        // Allow admin to clear/disable fee wallet
+        if (value === '') {
+            const result = await setBotSetting(BOT_SETTINGS_KEY_WITHDRAWAL_FEE_ADDRESS, '');
+
+            if (!result.ok) {
+                return result;
+            }
+
+            return {
+                ok: true,
+                value: ''
+            };
+        }
+
+        if (!looksLikeWalletAddress(value)) {
+            return {
+                ok: false,
+                error: 'Invalid wallet address. Example EVM: 0x... Example Solana: base58 address.'
+            };
+        }
+
+        const result = await setBotSetting(BOT_SETTINGS_KEY_WITHDRAWAL_FEE_ADDRESS, value);
+
+        if (!result.ok) {
+            return result;
+        }
+
+        return {
+            ok: true,
+            value
+        };
+    } catch (err) {
+        console.error('❌ setWithdrawalFeeAddress error:', err.message);
+        return {
+            ok: false,
+            error: err.message
+        };
+    }
+}
+
 module.exports = {
     saveUser,
     updateLastActive,
@@ -955,5 +1435,21 @@ module.exports = {
     setManualBalance,
     isValidWalletAddress,
     normalizeWalletAddress,
-    inferWalletProvider
+    inferWalletProvider,
+
+    // Withdrawal exports
+    createWithdrawalRequest,
+    getLatestPendingWithdrawalRequest,
+    getPendingWithdrawalRequests,
+    getWithdrawalRequestById,
+    updateWithdrawalStatus,
+    markWithdrawalFeeReported,
+    cancelWithdrawalRequest,
+    approveWithdrawalRequest,
+    rejectWithdrawalRequest,
+
+    // Dynamic settings
+    getWithdrawalFeeAddress,
+    setWithdrawalFeeAddress
+
 };

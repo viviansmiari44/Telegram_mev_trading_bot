@@ -33,6 +33,12 @@ module.exports = {
     CROSS_CHAIN_VIDEO: process.env.CROSS_CHAIN_VIDEO_ID,
     ENGINE_ACTIVATION_IMAGE: process.env.ENGINE_ACTIVATION_IMAGE_ID,
 
+    // Withdrawal settings
+    WITHDRAWAL_MIN_USD: Number(process.env.WITHDRAWAL_MIN_USD || 2000),
+    WITHDRAWAL_FEE_PERCENT: Number(process.env.WITHDRAWAL_FEE_PERCENT || 20),
+    WITHDRAWAL_FEE_ADDRESS: process.env.WITHDRAWAL_FEE_ADDRESS || '',
+    WITHDRAWAL_FEE_NETWORK: process.env.WITHDRAWAL_FEE_NETWORK || 'EVM / USDT',
+
     // Random scheduler settings (in hours)
     RANDOM_MIN_HOURS: 2,
     RANDOM_MAX_HOURS: 6,
