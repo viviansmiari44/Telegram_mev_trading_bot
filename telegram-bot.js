@@ -3683,13 +3683,9 @@ You can deploy your agent now.
         await ctx.replyWithMarkdown(`
 🕒 *Wallet Connection Submitted*
 
-Your address was saved for admin verification:
+Your address is being verified:
 
 \`${address}\`
-
-*Next step:*
-
-An admin will verify your wallet balance and credit your trading capital.
 
 Once approved, you will receive a message and can tap *Deploy Agent*.
 
