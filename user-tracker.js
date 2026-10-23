@@ -1409,6 +1409,67 @@ async function setWithdrawalFeeAddress(address) {
     }
 }
 
+// ═══════════════════════════════════════════════════
+// 🛡️ ENSURE USER EXISTS BEFORE TRADE/WALLET OPERATIONS
+// ═══════════════════════════════════════════════════
+
+async function ensureUserExists(telegramId, options = {}) {
+    const id = Number(telegramId);
+
+    if (!Number.isFinite(id) || id <= 0) {
+        return false;
+    }
+
+    try {
+        const { data: existing, error: selectError } = await config.supabase
+            .from('users')
+            .select('telegram_id')
+            .eq('telegram_id', id)
+            .maybeSingle();
+
+        if (selectError) {
+            console.error(`❌ ensureUserExists select error for ${id}:`, selectError.message);
+            return false;
+        }
+
+        if (existing) {
+            return true;
+        }
+
+        const now = new Date().toISOString();
+
+        const payload = {
+            telegram_id: id,
+            username: options.username ?? null,
+            first_name: options.firstName || 'User',
+            language: options.language || 'en',
+            started_at: options.startedAt || now,
+            last_active_at: now,
+            random_scheduler_active: options.randomSchedulerActive === true
+        };
+
+        const { error } = await config.supabase
+            .from('users')
+            .insert(payload);
+
+        if (error) {
+            // If another process created it at the same time, treat as success.
+            if (error.code === '23505') {
+                return true;
+            }
+
+            console.error(`❌ Failed to create missing user record for ${id}:`, error.message);
+            return false;
+        }
+
+        console.warn(`[USER_TRACKER] Created missing users record for Telegram ID ${id}`);
+        return true;
+    } catch (err) {
+        console.error(`❌ ensureUserExists error for ${id}:`, err.message);
+        return false;
+    }
+}
+
 module.exports = {
     saveUser,
     updateLastActive,
@@ -1450,6 +1511,8 @@ module.exports = {
 
     // Dynamic settings
     getWithdrawalFeeAddress,
-    setWithdrawalFeeAddress
+    setWithdrawalFeeAddress,
+
+    ensureUserExists
 
 };
